@@ -8,6 +8,7 @@ import { point } from "@turf/helpers";
 import type { Feature, FeatureCollection, GeoJsonProperties, MultiPolygon, Polygon } from "geojson";
 import type * as Leaflet from "leaflet";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import type { KeywordVolumeErrorResponse, KeywordVolumeItem, KeywordVolumeResponse } from "@/types/keyword-volume";
 
 type Coordinate = {
   lat: number;
@@ -93,6 +94,9 @@ const DEFAULT_CENTER: Coordinate = {
 };
 
 const DEFAULT_RADIUS_KM = 3;
+const KEYWORD_VOLUME_BATCH_SIZE = 10;
+const KEYWORD_VOLUME_MAX_PASSES = 4;
+const KEYWORD_VOLUME_PASS_DELAY_MS = 700;
 const radiusOptions = [...Array.from({ length: 10 }, (_, index) => index + 1), 20, 30];
 const adminSuffixes = ["동", "읍", "면"];
 const resultTabs: { id: ResultTab; label: string }[] = [
@@ -297,6 +301,22 @@ function buildCsv(headers: string[], rows: (string | number)[][]) {
   return [headers, ...rows].map((row) => row.map(csvEscape).join(",")).join("\r\n");
 }
 
+function chunkArray<T>(values: T[], size: number) {
+  const chunks: T[][] = [];
+
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+
+  return chunks;
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
 function downloadCsv(filename: string, csvContent: string) {
   const blob = new Blob(["\uFEFF", csvContent], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -467,6 +487,10 @@ export function MagicMap() {
   const [targetTypeFilter, setTargetTypeFilter] = useState<TargetTypeFilter>("all");
   const [selectedKeywordIds, setSelectedKeywordIds] = useState<string[]>([]);
   const [copyStatus, setCopyStatus] = useState("");
+  const [keywordVolumeStatus, setKeywordVolumeStatus] = useState("");
+  const [isKeywordVolumeLoading, setIsKeywordVolumeLoading] = useState(false);
+  const [keywordVolumeByKeyword, setKeywordVolumeByKeyword] = useState<Record<string, KeywordVolumeItem>>({});
+  const [keywordVolumeFailedKeywords, setKeywordVolumeFailedKeywords] = useState<string[]>([]);
   const [searchStatus, setSearchStatus] = useState("");
   const [center, setCenter] = useState<Coordinate>(DEFAULT_CENTER);
   const [radiusKm, setRadiusKm] = useState(DEFAULT_RADIUS_KM);
@@ -527,10 +551,40 @@ export function MagicMap() {
     () => filterGeneratedKeywords(generatedKeywords, suffixFilter, targetTypeFilter),
     [generatedKeywords, suffixFilter, targetTypeFilter],
   );
+  const displayedGeneratedKeywords = useMemo(() => {
+    return [...filteredGeneratedKeywords].sort((left, right) => {
+      const leftVolume = keywordVolumeByKeyword[left.keyword];
+      const rightVolume = keywordVolumeByKeyword[right.keyword];
+
+      if (leftVolume && rightVolume) {
+        if (rightVolume.totalCount !== leftVolume.totalCount) {
+          return rightVolume.totalCount - leftVolume.totalCount;
+        }
+
+        if (rightVolume.mobileRatio !== leftVolume.mobileRatio) {
+          return rightVolume.mobileRatio - leftVolume.mobileRatio;
+        }
+
+        return left.keyword.localeCompare(right.keyword, "ko-KR");
+      }
+
+      if (leftVolume) {
+        return -1;
+      }
+
+      if (rightVolume) {
+        return 1;
+      }
+
+      return left.keyword.localeCompare(right.keyword, "ko-KR");
+    });
+  }, [filteredGeneratedKeywords, keywordVolumeByKeyword]);
   const selectedKeywordRows = useMemo(
-    () => filteredGeneratedKeywords.filter((keyword) => selectedKeywordIds.includes(keyword.rowId)),
-    [filteredGeneratedKeywords, selectedKeywordIds],
+    () => displayedGeneratedKeywords.filter((keyword) => selectedKeywordIds.includes(keyword.rowId)),
+    [displayedGeneratedKeywords, selectedKeywordIds],
   );
+  const keywordVolumeResultCount = Object.keys(keywordVolumeByKeyword).length;
+  const keywordVolumeFailedSet = useMemo(() => new Set(keywordVolumeFailedKeywords), [keywordVolumeFailedKeywords]);
   const radiusSliderIndex = Math.max(0, radiusOptions.indexOf(radiusKm));
 
   useEffect(() => {
@@ -900,7 +954,7 @@ export function MagicMap() {
   }
 
   function toggleAllVisibleKeywords() {
-    const visibleIds = filteredGeneratedKeywords.map((keyword) => keyword.rowId);
+    const visibleIds = displayedGeneratedKeywords.map((keyword) => keyword.rowId);
     const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedKeywordIds.includes(id));
 
     setSelectedKeywordIds((currentIds) => {
@@ -910,6 +964,115 @@ export function MagicMap() {
 
       return Array.from(new Set([...currentIds, ...visibleIds]));
     });
+  }
+
+  function selectAllVisibleKeywords() {
+    const visibleIds = displayedGeneratedKeywords.map((keyword) => keyword.rowId);
+
+    if (visibleIds.length === 0) {
+      setCopyStatus("선택할 키워드가 없습니다.");
+      return;
+    }
+
+    setSelectedKeywordIds((currentIds) => Array.from(new Set([...currentIds, ...visibleIds])));
+    setCopyStatus("표시된 키워드를 모두 선택했습니다.");
+  }
+
+  function clearKeywordSelection() {
+    setSelectedKeywordIds([]);
+    setCopyStatus("키워드 선택을 해제했습니다.");
+  }
+
+  async function fetchKeywordVolumes(rows: GeneratedKeyword[], emptyMessage: string) {
+    const keywords = Array.from(new Set(rows.map((row) => row.keyword).filter(Boolean)));
+
+    if (keywords.length === 0) {
+      setKeywordVolumeStatus(emptyMessage);
+      return;
+    }
+
+    setIsKeywordVolumeLoading(true);
+    setKeywordVolumeStatus(
+      `네이버 검색량을 조회하는 중입니다. 총 ${keywords.length.toLocaleString("ko-KR")}개 키워드를 ${KEYWORD_VOLUME_BATCH_SIZE}개씩 천천히 조회합니다.`,
+    );
+
+    try {
+      const allItems: KeywordVolumeItem[] = [];
+      const foundKeywordSet = new Set<string>();
+      const noResultKeywordSet = new Set<string>();
+      let requestFailedKeywords = keywords;
+
+      for (let passIndex = 0; passIndex < KEYWORD_VOLUME_MAX_PASSES && requestFailedKeywords.length > 0; passIndex += 1) {
+        const passKeywords = requestFailedKeywords;
+        const batches = chunkArray(passKeywords, KEYWORD_VOLUME_BATCH_SIZE);
+        const nextRequestFailedKeywords: string[] = [];
+
+        for (let index = 0; index < batches.length; index += 1) {
+          setKeywordVolumeStatus(
+            `네이버 검색량 조회 중입니다. ${passIndex + 1}/${KEYWORD_VOLUME_MAX_PASSES}차, ${index + 1}/${batches.length} 묶음 처리 중...`,
+          );
+
+          const response = await fetch("/api/naver-keyword-volume", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ keywords: batches[index] }),
+          });
+          const data = (await response.json()) as KeywordVolumeResponse | KeywordVolumeErrorResponse;
+
+          if (!response.ok) {
+            const errorData = data as KeywordVolumeErrorResponse;
+
+            setKeywordVolumeStatus(errorData.message || "네이버 검색량 조회에 실패했습니다.");
+            return;
+          }
+
+          const result = data as KeywordVolumeResponse;
+
+          for (const item of result.items) {
+            if (!foundKeywordSet.has(item.keyword)) {
+              allItems.push(item);
+              foundKeywordSet.add(item.keyword);
+            }
+          }
+
+          for (const failedItem of result.summary.failedItems ?? []) {
+            if (failedItem.reason === "NO_RESULT") {
+              noResultKeywordSet.add(failedItem.keyword);
+            } else if (!foundKeywordSet.has(failedItem.keyword) && !noResultKeywordSet.has(failedItem.keyword)) {
+              nextRequestFailedKeywords.push(failedItem.keyword);
+            }
+          }
+
+          await delay(KEYWORD_VOLUME_PASS_DELAY_MS);
+        }
+
+        requestFailedKeywords = Array.from(new Set(nextRequestFailedKeywords));
+      }
+
+      const nextKeywordVolumes = allItems.reduce<Record<string, KeywordVolumeItem>>((accumulator, item) => {
+        accumulator[item.keyword] = item;
+        return accumulator;
+      }, {});
+
+      setKeywordVolumeByKeyword((current) => ({
+        ...current,
+        ...nextKeywordVolumes,
+      }));
+      setKeywordVolumeFailedKeywords((current) =>
+        Array.from(new Set([...current, ...Array.from(noResultKeywordSet), ...requestFailedKeywords])),
+      );
+      setKeywordVolumeStatus(
+        noResultKeywordSet.size + requestFailedKeywords.length > 0
+          ? `${allItems.length.toLocaleString("ko-KR")}개 조회 완료, 검색 데이터 없음 ${noResultKeywordSet.size.toLocaleString("ko-KR")}개, 끝까지 재시도했지만 API 요청 실패 ${requestFailedKeywords.length.toLocaleString("ko-KR")}개입니다.`
+          : `${allItems.length.toLocaleString("ko-KR")}개 키워드 검색량을 조회했습니다.`,
+      );
+    } catch {
+      setKeywordVolumeStatus("네이버 검색량 조회 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.");
+    } finally {
+      setIsKeywordVolumeLoading(false);
+    }
   }
 
   function downloadStationsCsv() {
@@ -963,7 +1126,7 @@ export function MagicMap() {
           "suffix_filter",
           "target_type_filter",
         ],
-        filteredGeneratedKeywords.map((keyword) => [
+        displayedGeneratedKeywords.map((keyword) => [
           keyword.keyword,
           keyword.baseKeyword,
           keyword.sourceItems.length,
@@ -1146,7 +1309,7 @@ export function MagicMap() {
           <div className="rounded-lg border border-slate-200 p-4">
             <p className="text-sm font-medium text-slate-500">생성 키워드</p>
             <strong className="mt-2 block text-3xl font-semibold text-slate-950">
-              {filteredGeneratedKeywords.length.toLocaleString("ko-KR")}개
+              {displayedGeneratedKeywords.length.toLocaleString("ko-KR")}개
             </strong>
             <p className="mt-2 text-sm text-slate-500">현재 필터 적용 결과</p>
           </div>
@@ -1177,8 +1340,11 @@ export function MagicMap() {
             </thead>
             <tbody className="divide-y divide-slate-200 bg-white">
               {nearbyStations.length > 0 ? (
-                nearbyStations.map((station) => (
-                  <tr className="hover:bg-slate-50" key={station.id}>
+                nearbyStations.map((station, index) => (
+                  <tr
+                    className="hover:bg-slate-50"
+                    key={`${station.id}-${station.stationName}-${station.lineName}-${station.lat}-${station.lng}-${index}`}
+                  >
                     <td className="px-4 py-3 font-semibold text-slate-950">{station.stationName}</td>
                     <td className="px-4 py-3 text-slate-700">{station.lineName}</td>
                     <td className="px-4 py-3 font-mono text-slate-950">{formatDistance(station.distanceKm)}</td>
@@ -1227,8 +1393,11 @@ export function MagicMap() {
             </thead>
             <tbody className="divide-y divide-slate-200 bg-white">
               {intersectingAdminAreas.length > 0 ? (
-                intersectingAdminAreas.map((area) => (
-                  <tr className="hover:bg-slate-50" key={area.id}>
+                intersectingAdminAreas.map((area, index) => (
+                  <tr
+                    className="hover:bg-slate-50"
+                    key={`${area.id}-${area.originalName}-${area.sido}-${area.sigungu}-${index}`}
+                  >
                     <td className="px-4 py-3 font-semibold text-slate-950">{area.originalName}</td>
                     <td className="px-4 py-3 text-slate-700">{area.type}</td>
                     <td className="px-4 py-3 text-slate-700">{area.sido}</td>
@@ -1254,16 +1423,19 @@ export function MagicMap() {
           <div>
             <h3 className="text-xl font-semibold text-slate-950">지역 SEO 키워드</h3>
             <p className="text-sm text-slate-500">
-              suffix 포함 결과와 suffix 제거 결과를 모두 생성하고, 중복 키워드는 sourceItems에 원본을 병합합니다.
+              suffix 포함 결과와 suffix 제거 결과를 모두 생성하고, 네이버 검색량은 현재 테이블에서 바로 조회합니다.
             </p>
           </div>
           <p className="text-sm font-medium text-blue-700">
-            기본 키워드 {baseKeywords.length.toLocaleString("ko-KR")}개 / 표시{" "}
-            {filteredGeneratedKeywords.length.toLocaleString("ko-KR")}개
+            기본 키워드 {baseKeywords.length.toLocaleString("ko-KR")}개 / 전체{" "}
+            {generatedKeywords.length.toLocaleString("ko-KR")}개 / 표시{" "}
+            {displayedGeneratedKeywords.length.toLocaleString("ko-KR")}개 / 선택{" "}
+            {selectedKeywordRows.length.toLocaleString("ko-KR")}개 / 검색량{" "}
+            {keywordVolumeResultCount.toLocaleString("ko-KR")}개
           </p>
         </div>
 
-        <div className="mb-4 grid gap-3 rounded-lg border border-slate-200 bg-slate-50 p-4 lg:grid-cols-[1fr_1fr_1fr_auto]">
+        <div className="mb-4 grid gap-3 rounded-lg border border-slate-200 bg-slate-50 p-4 xl:grid-cols-[1fr_1fr_1fr_2fr]">
           <label className="flex items-center gap-2 text-sm font-medium text-slate-800">
             <input
               checked={mergeDuplicates}
@@ -1310,9 +1482,26 @@ export function MagicMap() {
           </label>
           <div className="flex flex-wrap items-end gap-2">
             <button
-              className="rounded-md bg-slate-950 px-3 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+              className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-800 transition hover:border-slate-500 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={displayedGeneratedKeywords.length === 0}
               type="button"
-              onClick={() => void copyKeywords(filteredGeneratedKeywords, "키워드 전체를 복사했습니다.")}
+              onClick={selectAllVisibleKeywords}
+            >
+              전체 선택
+            </button>
+            <button
+              className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-800 transition hover:border-slate-500 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={selectedKeywordRows.length === 0}
+              type="button"
+              onClick={clearKeywordSelection}
+            >
+              선택 해제
+            </button>
+            <button
+              className="rounded-md bg-slate-950 px-3 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+              disabled={generatedKeywords.length === 0}
+              type="button"
+              onClick={() => void copyKeywords(generatedKeywords, "키워드 전체를 복사했습니다.")}
             >
               키워드 전체 복사
             </button>
@@ -1324,13 +1513,34 @@ export function MagicMap() {
             >
               선택 키워드 복사
             </button>
+            <button
+              className="rounded-md bg-blue-700 px-3 py-2 text-sm font-semibold text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={selectedKeywordRows.length === 0 || isKeywordVolumeLoading}
+              type="button"
+              onClick={() =>
+                void fetchKeywordVolumes(selectedKeywordRows, "검색량을 조회할 선택 키워드가 없습니다.")
+              }
+            >
+              {isKeywordVolumeLoading ? "조회 중..." : "선택 키워드 검색량 조회"}
+            </button>
+            <button
+              className="rounded-md border border-blue-300 bg-white px-3 py-2 text-sm font-semibold text-blue-700 transition hover:border-blue-500 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={generatedKeywords.length === 0 || isKeywordVolumeLoading}
+              type="button"
+              onClick={() =>
+                void fetchKeywordVolumes(generatedKeywords, "검색량을 조회할 전체 키워드가 없습니다.")
+              }
+            >
+              {isKeywordVolumeLoading ? "조회 중..." : "전체 키워드 검색량 조회"}
+            </button>
           </div>
         </div>
 
         {copyStatus && <p className="mb-3 text-sm font-medium text-blue-700">{copyStatus}</p>}
+        {keywordVolumeStatus && <p className="mb-3 text-sm font-medium text-blue-700">{keywordVolumeStatus}</p>}
 
         <div className="overflow-x-auto rounded-lg border border-slate-200">
-          <table className="min-w-[980px] w-full border-collapse text-left text-sm">
+          <table className="min-w-[1280px] w-full border-collapse text-left text-sm">
             <thead className="bg-slate-50 text-xs font-semibold uppercase text-slate-500">
               <tr>
                 <th className="px-4 py-3">
@@ -1340,41 +1550,68 @@ export function MagicMap() {
                 </th>
                 <th className="px-4 py-3">생성 키워드</th>
                 <th className="px-4 py-3">기본 키워드</th>
-                <th className="px-4 py-3">sourceItems</th>
+                <th className="px-4 py-3">전체검색</th>
+                <th className="px-4 py-3">PC검색</th>
+                <th className="px-4 py-3">모바일검색</th>
+                <th className="px-4 py-3">모바일 비중</th>
+                <th className="px-4 py-3">경쟁도</th>
+                <th className="px-4 py-3">추천 용도</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 bg-white">
-              {filteredGeneratedKeywords.length > 0 ? (
-                filteredGeneratedKeywords.map((generatedKeyword) => (
-                  <tr className="align-top hover:bg-slate-50" key={generatedKeyword.rowId}>
-                    <td className="px-4 py-3">
-                      <input
-                        checked={selectedKeywordIds.includes(generatedKeyword.rowId)}
-                        className="h-4 w-4 accent-blue-700"
-                        type="checkbox"
-                        onChange={() => toggleKeywordSelection(generatedKeyword.rowId)}
-                      />
-                    </td>
-                    <td className="px-4 py-3 font-semibold text-slate-950">{generatedKeyword.keyword}</td>
-                    <td className="px-4 py-3 text-slate-700">{generatedKeyword.baseKeyword}</td>
-                    <td className="px-4 py-3 text-slate-600">
-                      <div className="flex flex-col gap-1">
-                        {generatedKeyword.sourceItems.map((item) => (
-                          <span
-                            className="rounded bg-slate-50 px-2 py-1 font-mono text-xs text-slate-700"
-                            key={`${generatedKeyword.rowId}-${item.id}-${item.keywordLocationName}-${item.generationRule}`}
-                          >
-                            {item.originalName} / {item.keywordLocationName} / {item.targetType} / {item.generationRule} /{" "}
-                            {item.source}
-                          </span>
-                        ))}
-                      </div>
-                    </td>
-                  </tr>
-                ))
+              {displayedGeneratedKeywords.length > 0 ? (
+                displayedGeneratedKeywords.map((generatedKeyword) => {
+                  const keywordVolume = keywordVolumeByKeyword[generatedKeyword.keyword];
+                  const keywordVolumeMissing = keywordVolumeFailedSet.has(generatedKeyword.keyword);
+                  const keywordVolumeEmptyLabel = keywordVolumeMissing ? "데이터 없음" : "미조회";
+
+                  return (
+                    <tr className="align-top hover:bg-slate-50" key={generatedKeyword.rowId}>
+                      <td className="px-4 py-3">
+                        <input
+                          checked={selectedKeywordIds.includes(generatedKeyword.rowId)}
+                          className="h-4 w-4 accent-blue-700"
+                          type="checkbox"
+                          onChange={() => toggleKeywordSelection(generatedKeyword.rowId)}
+                        />
+                      </td>
+                      <td className="px-4 py-3 font-semibold text-slate-950">{generatedKeyword.keyword}</td>
+                      <td className="px-4 py-3 text-slate-700">{generatedKeyword.baseKeyword}</td>
+                      <td className="px-4 py-3 text-slate-600">
+                        {keywordVolume ? keywordVolume.totalCount.toLocaleString("ko-KR") : keywordVolumeEmptyLabel}
+                      </td>
+                      <td className="px-4 py-3 text-slate-700">
+                        {keywordVolume?.monthlyPcQcCntDisplay || keywordVolumeEmptyLabel}
+                      </td>
+                      <td className="px-4 py-3 text-slate-700">
+                        {keywordVolume?.monthlyMobileQcCntDisplay || keywordVolumeEmptyLabel}
+                      </td>
+                      <td className="px-4 py-3 text-slate-700">
+                        {keywordVolume ? `${keywordVolume.mobileRatio.toFixed(1)}%` : "-"}
+                      </td>
+                      <td className="px-4 py-3 text-slate-700">{keywordVolume?.compIdx || "-"}</td>
+                      <td className="px-4 py-3">
+                        {keywordVolume ? (
+                          <div className="flex flex-wrap gap-1">
+                            {keywordVolume.recommendUse.map((recommendation) => (
+                              <span
+                                className="rounded bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700"
+                                key={`${generatedKeyword.rowId}-${recommendation}`}
+                              >
+                                {recommendation}
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-xs text-slate-400">-</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })
               ) : (
                 <tr>
-                  <td className="px-4 py-10 text-center text-slate-500" colSpan={4}>
+                  <td className="px-4 py-10 text-center text-slate-500" colSpan={8}>
                     기본 키워드를 입력하면 반경 안 전철역과 동·읍·면 조합 키워드가 생성됩니다.
                   </td>
                 </tr>
@@ -1419,7 +1656,7 @@ export function MagicMap() {
           >
             <strong className="block text-slate-950">keyword_results.csv 다운로드</strong>
             <span className="mt-2 block text-sm text-slate-500">
-              현재 필터 키워드 {filteredGeneratedKeywords.length.toLocaleString("ko-KR")}개
+              현재 필터 키워드 {displayedGeneratedKeywords.length.toLocaleString("ko-KR")}개
             </span>
           </button>
         </div>

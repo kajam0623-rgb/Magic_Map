@@ -149,6 +149,55 @@ keyword_results.csv
 
 모든 CSV는 UTF-8 BOM을 포함해 엑셀에서 한글이 깨지지 않도록 생성합니다.
 
+## 네이버 검색량 조회
+
+`/keyword-volume` 페이지에서 키워드를 직접 입력하면 네이버 검색광고 API `/keywordstool`을 서버 API Route에서 호출해 월간 PC/모바일 검색량, 총 검색량, 모바일 비중, 클릭률, 경쟁도, 추천 용도를 확인할 수 있습니다.
+
+네이버 API 키는 서버 환경변수로만 사용하며 프론트엔드에 노출하지 않습니다.
+
+```env
+NAVER_SEARCHAD_API_KEY=
+NAVER_SEARCHAD_SECRET_KEY=
+NAVER_SEARCHAD_CUSTOMER_ID=
+NAVER_SEARCHAD_BASE_URL=https://api.searchad.naver.com
+```
+
+검색량 응답이 `< 10`인 경우 화면에는 `< 10`으로 표시하고, 총 검색량과 모바일 비중 계산에서는 편의를 위해 `5`로 환산합니다.
+
+한 번에 최대 50개 키워드까지만 조회할 수 있습니다. 50개를 초과하면 검색량 조회 페이지에서 제한 안내를 표시하며, 사용자는 textarea에서 키워드를 줄인 뒤 다시 조회할 수 있습니다.
+
+### 지역 SEO 키워드와 검색량 조회 연결
+
+기존 지역 SEO 키워드 탭에서 생성된 키워드를 선택한 뒤 `선택 키워드 검색량 조회` 버튼을 누르면 현재 테이블 안에 전체검색, PC검색, 모바일검색, 모바일 비중, 경쟁도, 추천 용도가 바로 표시됩니다. `전체 키워드 검색량 조회` 버튼은 생성된 전체 키워드를 50개씩 나눠 조회합니다.
+
+`/keyword-volume` 페이지는 키워드를 직접 입력해서 검색량만 따로 조회하는 보조 화면입니다.
+
+### Vercel 환경변수
+
+Vercel 배포 환경에서는 아래 값을 Project Settings > Environment Variables에 등록합니다.
+
+```env
+NEXT_PUBLIC_KAKAO_MAP_APP_KEY=
+NAVER_SEARCHAD_API_KEY=
+NAVER_SEARCHAD_SECRET_KEY=
+NAVER_SEARCHAD_CUSTOMER_ID=
+NAVER_SEARCHAD_BASE_URL=https://api.searchad.naver.com
+```
+
+네이버 secret key에는 절대 `NEXT_PUBLIC_` prefix를 붙이지 않습니다. `NEXT_PUBLIC_`가 붙은 값은 프론트엔드 번들에 노출될 수 있습니다.
+
+### 배포 후 테스트 순서
+
+1. `/`에서 지도와 반경 원이 표시되는지 확인합니다.
+2. 주소 검색과 지도 클릭으로 중심 좌표가 바뀌는지 확인합니다.
+3. 기본 키워드를 입력하고 생성 키워드 탭에 결과가 나오는지 확인합니다.
+4. 생성 키워드에서 일부 키워드를 선택하고 선택 개수가 표시되는지 확인합니다.
+5. 선택/전체 키워드 복사가 동작하는지 확인합니다.
+6. `선택 키워드 검색량 조회` 또는 `전체 키워드 검색량 조회`를 눌러 현재 테이블에 전체검색, PC검색, 모바일검색 값이 표시되는지 확인합니다.
+7. `/keyword-volume`에서 키워드를 직접 입력해 별도 검색량 조회가 되는지 확인합니다.
+8. 50개 초과 키워드 입력 시 `/keyword-volume`에서 제한 안내가 표시되는지 확인합니다.
+9. `keyword_volume_results.csv`를 다운로드해 엑셀에서 한글이 깨지지 않는지 확인합니다.
+
 ## 확인 방법
 
 1. 배포 페이지 또는 로컬 서버에서 지도가 표시되는지 확인합니다.
