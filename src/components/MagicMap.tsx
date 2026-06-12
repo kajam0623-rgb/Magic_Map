@@ -93,7 +93,7 @@ const DEFAULT_CENTER: Coordinate = {
 };
 
 const DEFAULT_RADIUS_KM = 3;
-const radiusOptions = Array.from({ length: 10 }, (_, index) => index + 1);
+const radiusOptions = [...Array.from({ length: 10 }, (_, index) => index + 1), 20, 30];
 const adminSuffixes = ["동", "읍", "면"];
 const resultTabs: { id: ResultTab; label: string }[] = [
   { id: "summary", label: "전체 요약" },
@@ -531,6 +531,7 @@ export function MagicMap() {
     () => filteredGeneratedKeywords.filter((keyword) => selectedKeywordIds.includes(keyword.rowId)),
     [filteredGeneratedKeywords, selectedKeywordIds],
   );
+  const radiusSliderIndex = Math.max(0, radiusOptions.indexOf(radiusKm));
 
   useEffect(() => {
     let isCanceled = false;
@@ -1023,12 +1024,12 @@ export function MagicMap() {
           <input
             id="radius"
             className="w-full accent-blue-700"
-            max={10}
-            min={1}
+            max={radiusOptions.length - 1}
+            min={0}
             step={1}
             type="range"
-            value={radiusKm}
-            onChange={(event) => setRadiusKm(Number(event.target.value))}
+            value={radiusSliderIndex}
+            onChange={(event) => setRadiusKm(radiusOptions[Number(event.target.value)] ?? DEFAULT_RADIUS_KM)}
           />
           <div className="grid grid-cols-5 gap-2">
             {radiusOptions.map((option) => (
