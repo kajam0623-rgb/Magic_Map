@@ -8,7 +8,7 @@ export default function Home() {
           <p className="text-sm font-semibold text-blue-700">Magic Map</p>
           <h1 className="text-3xl font-semibold tracking-normal sm:text-4xl">지역 SEO 반경 지도</h1>
           <p className="max-w-3xl text-sm leading-6 text-slate-600 sm:text-base">
-            5단계에서는 결과를 탭으로 정리하고 복사, 필터, CSV 다운로드까지 제공합니다.
+            결과를 탭으로 정리하고 복사, 필터, 네이버 검색량 조회와 엑셀 저장까지 제공합니다.
           </p>
         </header>
 

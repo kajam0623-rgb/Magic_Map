@@ -78,7 +78,7 @@ type GeneratedKeyword = {
   sourceItems: KeywordSourceItem[];
 };
 
-type ResultTab = "summary" | "stations" | "adminAreas" | "keywords" | "downloads";
+type ResultTab = "summary" | "stations" | "adminAreas" | "keywords";
 type SuffixFilter = "all" | KeywordSourceItem["generationRule"];
 type TargetTypeFilter = "all" | KeywordSourceItem["targetType"];
 
@@ -104,7 +104,6 @@ const resultTabs: { id: ResultTab; label: string }[] = [
   { id: "stations", label: "전철역" },
   { id: "adminAreas", label: "동/읍/면" },
   { id: "keywords", label: "생성 키워드" },
-  { id: "downloads", label: "CSV 다운로드" },
 ];
 
 function formatCoordinate(value: number) {
@@ -287,18 +286,14 @@ function filterGeneratedKeywords(
     .filter((keyword) => keyword.sourceItems.length > 0);
 }
 
-function csvEscape(value: string | number) {
+function excelEscape(value: string | number) {
   const text = String(value);
 
-  if (/[",\n\r]/.test(text)) {
-    return `"${text.replace(/"/g, '""')}"`;
-  }
-
-  return text;
-}
-
-function buildCsv(headers: string[], rows: (string | number)[][]) {
-  return [headers, ...rows].map((row) => row.map(csvEscape).join(",")).join("\r\n");
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 function chunkArray<T>(values: T[], size: number) {
@@ -315,19 +310,6 @@ function delay(ms: number) {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
   });
-}
-
-function downloadCsv(filename: string, csvContent: string) {
-  const blob = new Blob(["\uFEFF", csvContent], { type: "text/csv;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-
-  anchor.href = url;
-  anchor.download = filename;
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(url);
 }
 
 function parseCsvLine(line: string) {
@@ -1075,73 +1057,52 @@ export function MagicMap() {
     }
   }
 
-  function downloadStationsCsv() {
-    downloadCsv(
-      "stations_result.csv",
-      buildCsv(
-        ["id", "station_name", "line_name", "station_type", "distance_km", "lat", "lng", "source"],
-        nearbyStations.map((station) => [
-          station.id,
-          station.stationName,
-          station.lineName,
-          station.stationType,
-          station.distanceKm.toFixed(4),
-          formatCoordinate(station.lat),
-          formatCoordinate(station.lng),
-          station.source,
-        ]),
-      ),
-    );
-  }
+  function downloadKeywordVolumeExcel() {
+    const headers = [
+      "검색키워드",
+      "기본키워드",
+      "전체검색",
+      "PC검색",
+      "모바일검색",
+      "모바일비중",
+      "경쟁도",
+      "추천용도",
+    ];
+    const rows = displayedGeneratedKeywords.map((generatedKeyword) => {
+      const keywordVolume = keywordVolumeByKeyword[generatedKeyword.keyword];
+      const keywordVolumeMissing = keywordVolumeFailedSet.has(generatedKeyword.keyword);
+      const keywordVolumeEmptyLabel = keywordVolumeMissing ? "데이터 없음" : "미조회";
 
-  function downloadAdminAreasCsv() {
-    downloadCsv(
-      "admin_areas_result.csv",
-      buildCsv(
-        ["id", "original_name", "type", "sido", "sigungu", "distance_km", "include_rule", "source"],
-        intersectingAdminAreas.map((area) => [
-          area.id,
-          area.originalName,
-          area.type,
-          area.sido,
-          area.sigungu,
-          area.distanceKm.toFixed(4),
-          area.includeRule,
-          area.source,
-        ]),
-      ),
-    );
-  }
+      return [
+        generatedKeyword.keyword,
+        generatedKeyword.baseKeyword,
+        keywordVolume ? keywordVolume.totalCount.toLocaleString("ko-KR") : keywordVolumeEmptyLabel,
+        keywordVolume?.monthlyPcQcCntDisplay || keywordVolumeEmptyLabel,
+        keywordVolume?.monthlyMobileQcCntDisplay || keywordVolumeEmptyLabel,
+        keywordVolume ? `${keywordVolume.mobileRatio.toFixed(1)}%` : "-",
+        keywordVolume?.compIdx || "-",
+        keywordVolume?.recommendUse.join(", ") || "-",
+      ];
+    });
+    const tableRows = [headers, ...rows]
+      .map(
+        (row, rowIndex) =>
+          `<tr>${row
+            .map((cell) => (rowIndex === 0 ? `<th>${excelEscape(cell)}</th>` : `<td>${excelEscape(cell)}</td>`))
+            .join("")}</tr>`,
+      )
+      .join("");
+    const workbookHtml = `<!doctype html><html><head><meta charset="utf-8" /></head><body><table>${tableRows}</table></body></html>`;
+    const blob = new Blob(["\uFEFF", workbookHtml], { type: "application/vnd.ms-excel;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
 
-  function downloadKeywordResultsCsv() {
-    downloadCsv(
-      "keyword_results.csv",
-      buildCsv(
-        [
-          "keyword",
-          "base_keyword",
-          "source_count",
-          "source_items",
-          "merge_duplicates",
-          "suffix_filter",
-          "target_type_filter",
-        ],
-        displayedGeneratedKeywords.map((keyword) => [
-          keyword.keyword,
-          keyword.baseKeyword,
-          keyword.sourceItems.length,
-          keyword.sourceItems
-            .map(
-              (item) =>
-                `${item.originalName}|${item.keywordLocationName}|${item.targetType}|${item.generationRule}|${item.source}`,
-            )
-            .join("; "),
-          mergeDuplicates ? "ON" : "OFF",
-          suffixFilter,
-          targetTypeFilter,
-        ]),
-      ),
-    );
+    anchor.href = url;
+    anchor.download = "keyword_volume_results.xls";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
   }
 
   return (
@@ -1533,6 +1494,14 @@ export function MagicMap() {
             >
               {isKeywordVolumeLoading ? "조회 중..." : "전체 키워드 검색량 조회"}
             </button>
+            <button
+              className="rounded-md border border-emerald-300 bg-white px-3 py-2 text-sm font-semibold text-emerald-700 transition hover:border-emerald-500 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={displayedGeneratedKeywords.length === 0}
+              type="button"
+              onClick={downloadKeywordVolumeExcel}
+            >
+              검색량 엑셀 저장
+            </button>
           </div>
         </div>
 
@@ -1611,54 +1580,13 @@ export function MagicMap() {
                 })
               ) : (
                 <tr>
-                  <td className="px-4 py-10 text-center text-slate-500" colSpan={8}>
+                  <td className="px-4 py-10 text-center text-slate-500" colSpan={9}>
                     기본 키워드를 입력하면 반경 안 전철역과 동·읍·면 조합 키워드가 생성됩니다.
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
-        </div>
-      </div>
-      <div className={activeTab === "downloads" ? "border-t border-slate-200 p-5 lg:col-span-2" : "hidden"}>
-        <div className="mb-4">
-          <h3 className="text-xl font-semibold text-slate-950">CSV 다운로드</h3>
-          <p className="mt-1 text-sm text-slate-500">
-            모든 CSV는 UTF-8 BOM을 포함해 엑셀에서 한글이 깨지지 않도록 저장됩니다.
-          </p>
-        </div>
-
-        <div className="grid gap-3 md:grid-cols-3">
-          <button
-            className="rounded-lg border border-slate-200 bg-white p-4 text-left transition hover:border-blue-400 hover:bg-blue-50"
-            type="button"
-            onClick={downloadStationsCsv}
-          >
-            <strong className="block text-slate-950">stations_result.csv 다운로드</strong>
-            <span className="mt-2 block text-sm text-slate-500">
-              현재 반경 안 전철역 {nearbyStations.length.toLocaleString("ko-KR")}개
-            </span>
-          </button>
-          <button
-            className="rounded-lg border border-slate-200 bg-white p-4 text-left transition hover:border-blue-400 hover:bg-blue-50"
-            type="button"
-            onClick={downloadAdminAreasCsv}
-          >
-            <strong className="block text-slate-950">admin_areas_result.csv 다운로드</strong>
-            <span className="mt-2 block text-sm text-slate-500">
-              경계 교차 행정구역 {intersectingAdminAreas.length.toLocaleString("ko-KR")}개
-            </span>
-          </button>
-          <button
-            className="rounded-lg border border-slate-200 bg-white p-4 text-left transition hover:border-blue-400 hover:bg-blue-50"
-            type="button"
-            onClick={downloadKeywordResultsCsv}
-          >
-            <strong className="block text-slate-950">keyword_results.csv 다운로드</strong>
-            <span className="mt-2 block text-sm text-slate-500">
-              현재 필터 키워드 {displayedGeneratedKeywords.length.toLocaleString("ko-KR")}개
-            </span>
-          </button>
         </div>
       </div>
     </section>
