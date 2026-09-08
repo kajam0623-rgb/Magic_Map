@@ -38,6 +38,12 @@ export function findBestKeywordToolItem(keyword: string, items: NaverKeywordTool
   );
 }
 
+export function findExactKeywordToolItem(keyword: string, items: NaverKeywordToolItem[]) {
+  const compactInput = compactKeyword(keyword);
+
+  return items.find((item) => compactKeyword(item.relKeyword ?? "") === compactInput);
+}
+
 function roundOneDecimal(value: number) {
   return Math.round(value * 10) / 10;
 }

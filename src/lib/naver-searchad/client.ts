@@ -39,14 +39,15 @@ function getNaverSearchAdConfig() {
   };
 }
 
-export async function fetchNaverKeywordTool(keyword: string) {
+export async function fetchNaverKeywordTool(keyword: string | string[]) {
   const config = getNaverSearchAdConfig();
   const method = "GET";
   const timestamp = Date.now().toString();
   const signature = createNaverSearchAdSignature(timestamp, method, KEYWORD_TOOL_URI, config.secretKey);
   const url = new URL(KEYWORD_TOOL_URI, config.baseUrl);
+  const hintKeywords = Array.isArray(keyword) ? keyword.join(",") : keyword;
 
-  url.searchParams.set("hintKeywords", keyword);
+  url.searchParams.set("hintKeywords", hintKeywords);
   url.searchParams.set("showDetail", "1");
 
   const response = await fetch(url, {

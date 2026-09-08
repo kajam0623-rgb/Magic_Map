@@ -1,9 +1,9 @@
 "use client";
 
+import bbox from "@turf/bbox";
 import booleanIntersects from "@turf/boolean-intersects";
 import buffer from "@turf/buffer";
 import centroid from "@turf/centroid";
-import distance from "@turf/distance";
 import { point } from "@turf/helpers";
 import type { Feature, FeatureCollection, GeoJsonProperties, MultiPolygon, Polygon } from "geojson";
 import type * as Leaflet from "leaflet";
@@ -54,6 +54,9 @@ type AdminArea = {
   sigungu: string;
   source: string;
   feature: AdminFeature;
+  // 데이터 로드 시 한 번만 계산해 두고 반경이 바뀔 때마다 재사용한다.
+  bounds: { minLng: number; minLat: number; maxLng: number; maxLat: number };
+  centroidCoord: Coordinate;
 };
 
 type AdminAreaWithDistance = AdminArea & {
@@ -94,8 +97,10 @@ const DEFAULT_CENTER: Coordinate = {
 };
 
 const DEFAULT_RADIUS_KM = 3;
-const KEYWORD_VOLUME_BATCH_SIZE = 10;
+// 서버가 키워드를 5개씩 묶어 네이버에 보내므로 한 요청에 25개까지 담아도 네이버 호출은 5회다.
+const KEYWORD_VOLUME_BATCH_SIZE = 25;
 const KEYWORD_VOLUME_MAX_PASSES = 4;
+const KEYWORD_ROW_RENDER_STEP = 200;
 const KEYWORD_VOLUME_PASS_DELAY_MS = 700;
 const radiusOptions = [...Array.from({ length: 10 }, (_, index) => index + 1), 20, 30];
 const adminSuffixes = ["동", "읍", "면"];
@@ -407,6 +412,8 @@ function parseAdminGeoJson(geoJson: unknown) {
 
   return collection.features.filter(isPolygonFeature).map((feature, index) => {
     const properties = feature.properties ?? {};
+    const [minLng, minLat, maxLng, maxLat] = bbox(feature);
+    const [centroidLng, centroidLat] = centroid(feature).geometry.coordinates;
 
     return {
       id: textValue(properties.id, `admin-${index + 1}`),
@@ -418,6 +425,8 @@ function parseAdminGeoJson(geoJson: unknown) {
       sigungu: textValue(properties.sigungu ?? properties.sggnm),
       source: textValue(properties.source),
       feature,
+      bounds: { minLng, minLat, maxLng, maxLat },
+      centroidCoord: { lat: centroidLat, lng: centroidLng },
     };
   });
 }
@@ -480,6 +489,7 @@ export function MagicMap() {
   const [stationLoadStatus, setStationLoadStatus] = useState("stations.csv를 불러오는 중입니다.");
   const [adminAreas, setAdminAreas] = useState<AdminArea[]>([]);
   const [adminLoadStatus, setAdminLoadStatus] = useState("eupmyeondong.geojson을 불러오는 중입니다.");
+  const [visibleKeywordRowCount, setVisibleKeywordRowCount] = useState(KEYWORD_ROW_RENDER_STEP);
 
   const selectedLabel = useMemo(
     () => `${formatCoordinate(center.lat)}, ${formatCoordinate(center.lng)}`,
@@ -511,18 +521,31 @@ export function MagicMap() {
       return [];
     }
 
-    return adminAreas
-      .filter((area) => booleanIntersects(radiusPolygon, area.feature))
-      .map((area) => {
-        const areaCentroid = centroid(area.feature);
-        const distanceKm = distance(centerPoint, areaCentroid, { units: "kilometers" });
+    // 전국 3,500여 개 폴리곤을 매번 전수 판정하면 반경을 바꿀 때마다 화면이 멈춘다.
+    // 값싼 bounding box 겹침 검사로 후보를 먼저 걸러내고, 남은 것만 폴리곤 교차를 본다.
+    const latDelta = radiusKm / 111.32;
+    const cosLat = Math.cos((center.lat * Math.PI) / 180);
+    const lngDelta = radiusKm / (111.32 * Math.max(Math.abs(cosLat), 0.01));
+    const searchMinLat = center.lat - latDelta;
+    const searchMaxLat = center.lat + latDelta;
+    const searchMinLng = center.lng - lngDelta;
+    const searchMaxLng = center.lng + lngDelta;
 
-        return {
-          ...area,
-          distanceKm,
-          includeRule: "polygon_intersects" as const,
-        };
+    return adminAreas
+      .filter((area) => {
+        const { minLng, minLat, maxLng, maxLat } = area.bounds;
+
+        if (maxLat < searchMinLat || minLat > searchMaxLat || maxLng < searchMinLng || minLng > searchMaxLng) {
+          return false;
+        }
+
+        return booleanIntersects(radiusPolygon, area.feature);
       })
+      .map((area) => ({
+        ...area,
+        distanceKm: distanceBetweenKm(center, area.centroidCoord),
+        includeRule: "polygon_intersects" as const,
+      }))
       .sort((left, right) => left.distanceKm - right.distanceKm);
   }, [adminAreas, center, radiusKm]);
   const generatedKeywords = useMemo(
@@ -561,6 +584,13 @@ export function MagicMap() {
       return left.keyword.localeCompare(right.keyword, "ko-KR");
     });
   }, [filteredGeneratedKeywords, keywordVolumeByKeyword]);
+  // 30km 반경이면 1,400행이 넘어 DOM이 폭발한다. 화면에는 일부만 그리고,
+  // 선택/복사/엑셀은 아래처럼 필터된 전체를 그대로 대상으로 둔다.
+  const renderedGeneratedKeywords = useMemo(
+    () => displayedGeneratedKeywords.slice(0, visibleKeywordRowCount),
+    [displayedGeneratedKeywords, visibleKeywordRowCount],
+  );
+  const hiddenKeywordRowCount = displayedGeneratedKeywords.length - renderedGeneratedKeywords.length;
   const selectedKeywordRows = useMemo(
     () => displayedGeneratedKeywords.filter((keyword) => selectedKeywordIds.includes(keyword.rowId)),
     [displayedGeneratedKeywords, selectedKeywordIds],
@@ -1528,8 +1558,8 @@ export function MagicMap() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 bg-white">
-              {displayedGeneratedKeywords.length > 0 ? (
-                displayedGeneratedKeywords.map((generatedKeyword) => {
+              {renderedGeneratedKeywords.length > 0 ? (
+                renderedGeneratedKeywords.map((generatedKeyword) => {
                   const keywordVolume = keywordVolumeByKeyword[generatedKeyword.keyword];
                   const keywordVolumeMissing = keywordVolumeFailedSet.has(generatedKeyword.keyword);
                   const keywordVolumeEmptyLabel = keywordVolumeMissing ? "데이터 없음" : "미조회";
@@ -1588,6 +1618,22 @@ export function MagicMap() {
             </tbody>
           </table>
         </div>
+        {hiddenKeywordRowCount > 0 ? (
+          <div className="flex flex-col items-center gap-2 border-t border-slate-200 px-4 py-4">
+            <p className="text-sm text-slate-600">
+              {renderedGeneratedKeywords.length.toLocaleString("ko-KR")}개 표시 중 · 나머지{" "}
+              {hiddenKeywordRowCount.toLocaleString("ko-KR")}개는 숨겨져 있습니다. 복사와 엑셀 저장은 숨겨진 키워드까지
+              모두 포함합니다.
+            </p>
+            <button
+              className="h-10 rounded-md border border-slate-300 bg-white px-4 text-sm font-medium text-slate-700 transition hover:border-slate-500"
+              type="button"
+              onClick={() => setVisibleKeywordRowCount((current) => current + KEYWORD_ROW_RENDER_STEP)}
+            >
+              {Math.min(KEYWORD_ROW_RENDER_STEP, hiddenKeywordRowCount).toLocaleString("ko-KR")}개 더 보기
+            </button>
+          </div>
+        ) : null}
       </div>
     </section>
   );
