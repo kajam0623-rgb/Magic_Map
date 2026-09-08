@@ -69,7 +69,7 @@ type KeywordSourceItem = {
   originalName: string;
   keywordLocationName: string;
   itemType: "station" | "admin_area";
-  targetType: "전철역" | "동" | "읍" | "면";
+  targetType: "전철역" | "시군구" | "동" | "읍" | "면";
   generationRule: "suffix_included" | "suffix_removed";
   source: string;
 };
@@ -104,6 +104,8 @@ const KEYWORD_ROW_RENDER_STEP = 200;
 const KEYWORD_VOLUME_PASS_DELAY_MS = 700;
 const radiusOptions = [...Array.from({ length: 10 }, (_, index) => index + 1), 20, 30];
 const adminSuffixes = ["동", "읍", "면"];
+const sigunguSuffixes = ["구", "시", "군"];
+const MIN_LOCATION_NAME_LENGTH = 2;
 const resultTabs: { id: ResultTab; label: string }[] = [
   { id: "summary", label: "전체 요약" },
   { id: "stations", label: "전철역" },
@@ -138,6 +140,28 @@ function withStationSuffix(stationName: string) {
   return stationName.endsWith("역") ? stationName : `${stationName}역`;
 }
 
+// 괄호 안 부역명(강변(동서울터미널))은 별도 검색어라 본역명만 남긴다.
+function normalizeStationName(stationName: string) {
+  return stationName.replace(/\s*[（(].*$/, "").trim();
+}
+
+// 행정동 번호(범어1동, 수성2·3가동)로는 아무도 검색하지 않는다.
+// 번호를 떼어 법정동 형태(범어동, 수성동)로 되돌린다.
+function normalizeAdminName(name: string) {
+  const matchedSuffix = adminSuffixes.find((suffix) => name.endsWith(suffix));
+
+  if (!matchedSuffix) {
+    return name;
+  }
+
+  const stem = name
+    .slice(0, -matchedSuffix.length)
+    .replace(/[0-9·.]+가?$/, "")
+    .replace(/[0-9·.]+$/, "");
+
+  return stem.length > 0 ? `${stem}${matchedSuffix}` : name;
+}
+
 function removeTrailingSuffix(name: string, suffixes: string[]) {
   const matchedSuffix = suffixes.find((suffix) => name.endsWith(suffix));
 
@@ -149,11 +173,18 @@ function removeTrailingSuffix(name: string, suffixes: string[]) {
 }
 
 function keywordLocationVariants(nameWithSuffix: string, suffixes: string[]) {
+  const bareName = removeTrailingSuffix(nameWithSuffix, suffixes);
+
   return Array.from(
-    new Set([
-      { name: nameWithSuffix, rule: "suffix_included" as const },
-      { name: removeTrailingSuffix(nameWithSuffix, suffixes), rule: "suffix_removed" as const },
-    ].map((variant) => `${variant.name}\t${variant.rule}`)),
+    new Set(
+      [
+        { name: nameWithSuffix, rule: "suffix_included" as const },
+        { name: bareName, rule: "suffix_removed" as const },
+      ]
+        // 상동 -> 상, 중동 -> 중처럼 한 글자만 남으면 지명 구실을 못 한다.
+        .filter((variant) => variant.name.length >= MIN_LOCATION_NAME_LENGTH)
+        .map((variant) => `${variant.name}\t${variant.rule}`),
+    ),
   ).map((serialized) => {
     const [name, rule] = serialized.split("\t") as [string, KeywordSourceItem["generationRule"]];
 
@@ -229,9 +260,17 @@ function generateSeoKeywords(
   const keywordMap = new Map<string, GeneratedKeyword>();
   const keywordRows: GeneratedKeyword[] = [];
 
+  const sigunguAreas = new Map<string, AdminAreaWithDistance>();
+
+  for (const area of adminAreas) {
+    if (area.sigungu && !sigunguAreas.has(area.sigungu)) {
+      sigunguAreas.set(area.sigungu, area);
+    }
+  }
+
   for (const baseKeyword of baseKeywords) {
     for (const station of stations) {
-      const stationNameWithSuffix = withStationSuffix(station.stationName);
+      const stationNameWithSuffix = withStationSuffix(normalizeStationName(station.stationName));
       const variants = keywordLocationVariants(stationNameWithSuffix, ["역"]);
 
       for (const variant of variants) {
@@ -247,8 +286,26 @@ function generateSeoKeywords(
       }
     }
 
+    // 수성구치과, 강남치과처럼 시군구 단위 키워드가 동 단위보다 검색량이 큰 경우가 많다.
+    for (const [sigungu, area] of sigunguAreas) {
+      const variants = keywordLocationVariants(sigungu, sigunguSuffixes);
+
+      for (const variant of variants) {
+        addGeneratedKeyword(keywordMap, keywordRows, mergeDuplicates, `${variant.name}${baseKeyword}`, baseKeyword, {
+          id: `sigungu:${sigungu}`,
+          originalName: sigungu,
+          keywordLocationName: variant.name,
+          itemType: "admin_area",
+          targetType: "시군구",
+          generationRule: variant.rule,
+          source: area.source,
+        });
+      }
+    }
+
     for (const area of adminAreas.filter(isTargetAdminArea)) {
-      const variants = keywordLocationVariants(area.originalName, adminSuffixes);
+      const normalizedName = normalizeAdminName(area.originalName);
+      const variants = keywordLocationVariants(normalizedName, adminSuffixes);
 
       for (const variant of variants) {
         addGeneratedKeyword(keywordMap, keywordRows, mergeDuplicates, `${variant.name}${baseKeyword}`, baseKeyword, {
@@ -1215,7 +1272,8 @@ export function MagicMap() {
             onChange={(event) => setBaseKeywordInput(event.target.value)}
           />
           <p className="text-xs leading-5 text-slate-500">
-            쉼표 또는 줄바꿈으로 여러 키워드를 입력할 수 있습니다.
+            쉼표 또는 줄바꿈으로 여러 키워드를 입력할 수 있습니다. 치과추천, 치과야간진료처럼 수식어까지 붙여 넣으면 그대로
+            조합합니다.
           </p>
         </div>
 
@@ -1466,6 +1524,7 @@ export function MagicMap() {
             >
               <option value="all">전체</option>
               <option value="전철역">전철역</option>
+              <option value="시군구">시군구</option>
               <option value="동">동</option>
               <option value="읍">읍</option>
               <option value="면">면</option>
