@@ -1207,6 +1207,7 @@ export function MagicMap() {
       "모바일검색",
       "모바일비중",
       "경쟁업체",
+      "노출광고",
       "기회지수",
       "경쟁도",
       "추천용도",
@@ -1224,6 +1225,7 @@ export function MagicMap() {
         keywordVolume?.monthlyMobileQcCntDisplay || keywordVolumeEmptyLabel,
         keywordVolume ? `${keywordVolume.mobileRatio.toFixed(1)}%` : "-",
         keywordVolume?.placeCount === undefined ? "-" : keywordVolume.placeCount.toLocaleString("ko-KR"),
+        keywordVolume ? keywordVolume.adDepth.toLocaleString("ko-KR") : "-",
         keywordVolume?.opportunityScore === undefined ? "-" : keywordVolume.opportunityScore.toLocaleString("ko-KR"),
         keywordVolume?.compIdx || "-",
         keywordVolume?.recommendUse.join(", ") || "-",
@@ -1680,6 +1682,7 @@ export function MagicMap() {
                 <th className="px-4 py-3 text-right">모바일검색</th>
                 <th className="px-4 py-3 text-right">모바일 비중</th>
                 <th className="px-4 py-3 text-right">경쟁 업체</th>
+                <th className="px-4 py-3 text-right">노출 광고</th>
                 <th className="px-4 py-3 text-right">기회 지수</th>
                 <th className="px-4 py-3">경쟁도</th>
                 <th className="px-4 py-3">추천 용도</th>
@@ -1728,6 +1731,9 @@ export function MagicMap() {
                           ? "-"
                           : keywordVolume.placeCount.toLocaleString("ko-KR")}
                       </td>
+                      <td className="tabular px-4 py-3 text-right text-ink-soft">
+                        {keywordVolume ? keywordVolume.adDepth.toLocaleString("ko-KR") : "-"}
+                      </td>
                       {/* 검색량 ÷ 경쟁 업체 수. 여기가 이 표에서 노릴 순서를 정하는 숫자다. */}
                       <td
                         className={`tabular px-4 py-3 text-right ${
@@ -1736,9 +1742,16 @@ export function MagicMap() {
                             : "text-ink"
                         }`}
                       >
-                        {keywordVolume?.opportunityScore === undefined
-                          ? "-"
-                          : keywordVolume.opportunityScore.toLocaleString("ko-KR")}
+                        {keywordVolume?.opportunityScore === undefined ? (
+                          "-"
+                        ) : (
+                          <>
+                            {keywordVolume.opportunityScore.toLocaleString("ko-KR")}
+                            <span className="ml-1 text-xs font-normal text-ink-faint">
+                              {keywordVolume.opportunityBasis === "place" ? "업체" : "광고"}
+                            </span>
+                          </>
+                        )}
                       </td>
                       <td className="px-4 py-3">
                         {keywordVolume?.compIdx ? (
@@ -1778,7 +1791,7 @@ export function MagicMap() {
                 })
               ) : (
                 <tr>
-                  <td className="px-4 py-10 text-center text-ink-soft" colSpan={11}>
+                  <td className="px-4 py-10 text-center text-ink-soft" colSpan={12}>
                     기본 키워드를 입력하면 반경 안 전철역과 동·읍·면 조합 키워드가 생성됩니다.
                   </td>
                 </tr>
