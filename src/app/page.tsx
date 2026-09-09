@@ -2,14 +2,14 @@ import { MagicMap } from "@/components/MagicMap";
 
 export default function Home() {
   return (
-    <main className="min-h-screen bg-slate-100 px-4 py-6 text-slate-950 sm:px-6 lg:px-8">
-      <div className="mx-auto flex w-full max-w-7xl flex-col gap-5">
-        <header className="flex flex-col gap-2">
-          <p className="text-sm font-semibold text-blue-700">Magic Map</p>
-          <h1 className="text-3xl font-semibold tracking-normal sm:text-4xl">지역 SEO 반경 지도</h1>
-          <p className="max-w-3xl text-sm leading-6 text-slate-600 sm:text-base">
-            결과를 탭으로 정리하고 복사, 필터, 네이버 검색량 조회와 엑셀 저장까지 제공합니다.
-          </p>
+    <main className="min-h-screen bg-canvas px-4 py-5 text-ink sm:px-6 lg:px-8">
+      <div className="mx-auto flex w-full max-w-7xl flex-col gap-4">
+        <header className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-2 border-b border-rule pb-4">
+          <div className="flex items-baseline gap-3">
+            <h1 className="whitespace-nowrap text-xl font-semibold tracking-tight text-ink">Magic Map</h1>
+            <p className="text-sm text-ink-soft">반경 안 지명으로 지역 SEO 키워드를 만든다</p>
+          </div>
+          <p className="eyebrow">전철역 · 동읍면 · 시군구 × 네이버 검색량</p>
         </header>
 
         <MagicMap />

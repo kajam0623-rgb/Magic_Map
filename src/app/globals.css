@@ -1,57 +1,187 @@
+@import url("https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.css");
 @import "leaflet/dist/leaflet.css";
 @import "tailwindcss";
 
+/*
+  지형도 색을 빌려온다. 수계의 청록이 주색이고, 신호 주황은 "여기가 기회다"를
+  말할 때만 쓴다. 두 색을 같은 화면에서 경쟁시키지 않는다.
+*/
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --canvas: #e9efee;
+  --surface: #ffffff;
+  --field: #f4f8f7;
+  --rule: #d5e0de;
+  --rule-soft: #e8edec;
+
+  --ink: #0f1d20;
+  --ink-soft: #5c6e71;
+  --ink-faint: #8a9a9c;
+
+  --tide: #0d7a82;
+  --tide-deep: #084f55;
+  --tide-wash: #e3efef;
+
+  --signal: #c2410c;
+  --signal-wash: #fdf0e8;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: "Geist", "Geist Fallback", ui-sans-serif, system-ui, sans-serif;
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-field: var(--field);
+  --color-rule: var(--rule);
+  --color-rule-soft: var(--rule-soft);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-ink-faint: var(--ink-faint);
+  --color-tide: var(--tide);
+  --color-tide-deep: var(--tide-deep);
+  --color-tide-wash: var(--tide-wash);
+  --color-signal: var(--signal);
+  --color-signal-wash: var(--signal-wash);
+
+  --font-sans: "Pretendard Variable", Pretendard, "Geist", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Geist Mono", "Geist Mono Fallback", ui-monospace, monospace;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
 body {
-  background: var(--background);
-  color: var(--foreground);
+  background: var(--canvas);
+  color: var(--ink);
   font-family: var(--font-sans);
 }
 
+/* 좌표·검색량·거리는 자릿수가 흔들리면 읽기 어렵다. */
+.tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.eyebrow {
+  color: var(--ink-faint);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+:where(a, button, input, textarea, select):focus-visible {
+  outline: 2px solid var(--tide);
+  outline-offset: 2px;
+}
+
+/* ---- 반경 축척자 ---------------------------------------------------------
+   반경 선택은 이 도구의 중심 동작이라 지도 축척 바 모양을 그대로 빌려 왔다.
+   눈금 높이가 거리 단위(1~10km, 20·30km)를 구분하고, 선택된 눈금만 지도 위
+   원과 같은 청록으로 채워진다.
+-------------------------------------------------------------------------- */
+.scale-bar {
+  display: grid;
+  gap: 1px;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  background: var(--rule);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.scale-tick {
+  align-items: flex-end;
+  background: var(--surface);
+  border: 0;
+  color: var(--ink-soft);
+  cursor: pointer;
+  display: flex;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-variant-numeric: tabular-nums;
+  padding-bottom: 6px;
+  padding-top: 18px;
+  position: relative;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
+}
+
+.scale-tick::before {
+  background: var(--rule);
+  content: "";
+  height: 7px;
+  left: 50%;
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  transition: background 120ms ease, height 120ms ease;
+  width: 1px;
+}
+
+/* 5·10·20·30km는 눈금을 길게 빼서 자처럼 읽히게 한다. */
+.scale-tick[data-major="true"]::before {
+  height: 12px;
+}
+
+.scale-tick:hover {
+  background: var(--field);
+  color: var(--ink);
+}
+
+.scale-tick[aria-pressed="true"] {
+  background: var(--tide);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.scale-tick[aria-pressed="true"]::before {
+  background: rgb(255 255 255 / 0.55);
+  height: 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scale-tick,
+  .scale-tick::before {
+    transition: none;
+  }
+}
+
+/* ---- 지도 --------------------------------------------------------------- */
 .magic-map-leaflet {
   height: 100%;
-  min-height: 680px;
+  min-height: 420px;
   overflow: hidden;
   width: 100%;
 }
 
+@media (min-width: 1024px) {
+  .magic-map-leaflet {
+    min-height: 680px;
+  }
+}
+
 .magic-map-leaflet.leaflet-container {
-  background: #e2e8f0;
-  color: #0f172a;
+  background: var(--canvas);
+  color: var(--ink);
   font-family: var(--font-sans);
   z-index: 0;
+}
+
+.magic-map-leaflet .leaflet-control-zoom a {
+  border-color: var(--rule);
+  color: var(--ink);
 }
 
 .magic-map-marker {
   align-items: center;
   background: #ffffff;
-  border: 2px solid #2563eb;
+  border: 2px solid var(--tide);
   border-radius: 999px;
-  box-shadow: 0 8px 18px rgb(15 23 42 / 0.2);
+  box-shadow: 0 8px 18px rgb(15 29 32 / 0.22);
   display: flex;
   justify-content: center;
 }
 
 .magic-map-marker span {
-  background: #2563eb;
+  background: var(--tide);
   border-radius: 999px;
   display: block;
   height: 10px;

@@ -1,9 +1,9 @@
 "use client";
 
+import bbox from "@turf/bbox";
 import booleanIntersects from "@turf/boolean-intersects";
 import buffer from "@turf/buffer";
 import centroid from "@turf/centroid";
-import distance from "@turf/distance";
 import { point } from "@turf/helpers";
 import type { Feature, FeatureCollection, GeoJsonProperties, MultiPolygon, Polygon } from "geojson";
 import type * as Leaflet from "leaflet";
@@ -54,6 +54,9 @@ type AdminArea = {
   sigungu: string;
   source: string;
   feature: AdminFeature;
+  // 데이터 로드 시 한 번만 계산해 두고 반경이 바뀔 때마다 재사용한다.
+  bounds: { minLng: number; minLat: number; maxLng: number; maxLat: number };
+  centroidCoord: Coordinate;
 };
 
 type AdminAreaWithDistance = AdminArea & {
@@ -66,7 +69,7 @@ type KeywordSourceItem = {
   originalName: string;
   keywordLocationName: string;
   itemType: "station" | "admin_area";
-  targetType: "전철역" | "동" | "읍" | "면";
+  targetType: "전철역" | "시군구" | "동" | "읍" | "면";
   generationRule: "suffix_included" | "suffix_removed";
   source: string;
 };
@@ -94,11 +97,15 @@ const DEFAULT_CENTER: Coordinate = {
 };
 
 const DEFAULT_RADIUS_KM = 3;
-const KEYWORD_VOLUME_BATCH_SIZE = 10;
+// 서버가 키워드를 5개씩 묶어 네이버에 보내므로 한 요청에 25개까지 담아도 네이버 호출은 5회다.
+const KEYWORD_VOLUME_BATCH_SIZE = 25;
 const KEYWORD_VOLUME_MAX_PASSES = 4;
+const KEYWORD_ROW_RENDER_STEP = 200;
 const KEYWORD_VOLUME_PASS_DELAY_MS = 700;
 const radiusOptions = [...Array.from({ length: 10 }, (_, index) => index + 1), 20, 30];
 const adminSuffixes = ["동", "읍", "면"];
+const sigunguSuffixes = ["구", "시", "군"];
+const MIN_LOCATION_NAME_LENGTH = 2;
 const resultTabs: { id: ResultTab; label: string }[] = [
   { id: "summary", label: "전체 요약" },
   { id: "stations", label: "전철역" },
@@ -133,6 +140,28 @@ function withStationSuffix(stationName: string) {
   return stationName.endsWith("역") ? stationName : `${stationName}역`;
 }
 
+// 괄호 안 부역명(강변(동서울터미널))은 별도 검색어라 본역명만 남긴다.
+function normalizeStationName(stationName: string) {
+  return stationName.replace(/\s*[（(].*$/, "").trim();
+}
+
+// 행정동 번호(범어1동, 수성2·3가동)로는 아무도 검색하지 않는다.
+// 번호를 떼어 법정동 형태(범어동, 수성동)로 되돌린다.
+function normalizeAdminName(name: string) {
+  const matchedSuffix = adminSuffixes.find((suffix) => name.endsWith(suffix));
+
+  if (!matchedSuffix) {
+    return name;
+  }
+
+  const stem = name
+    .slice(0, -matchedSuffix.length)
+    .replace(/[0-9·.]+가?$/, "")
+    .replace(/[0-9·.]+$/, "");
+
+  return stem.length > 0 ? `${stem}${matchedSuffix}` : name;
+}
+
 function removeTrailingSuffix(name: string, suffixes: string[]) {
   const matchedSuffix = suffixes.find((suffix) => name.endsWith(suffix));
 
@@ -144,11 +173,18 @@ function removeTrailingSuffix(name: string, suffixes: string[]) {
 }
 
 function keywordLocationVariants(nameWithSuffix: string, suffixes: string[]) {
+  const bareName = removeTrailingSuffix(nameWithSuffix, suffixes);
+
   return Array.from(
-    new Set([
-      { name: nameWithSuffix, rule: "suffix_included" as const },
-      { name: removeTrailingSuffix(nameWithSuffix, suffixes), rule: "suffix_removed" as const },
-    ].map((variant) => `${variant.name}\t${variant.rule}`)),
+    new Set(
+      [
+        { name: nameWithSuffix, rule: "suffix_included" as const },
+        { name: bareName, rule: "suffix_removed" as const },
+      ]
+        // 상동 -> 상, 중동 -> 중처럼 한 글자만 남으면 지명 구실을 못 한다.
+        .filter((variant) => variant.name.length >= MIN_LOCATION_NAME_LENGTH)
+        .map((variant) => `${variant.name}\t${variant.rule}`),
+    ),
   ).map((serialized) => {
     const [name, rule] = serialized.split("\t") as [string, KeywordSourceItem["generationRule"]];
 
@@ -224,9 +260,17 @@ function generateSeoKeywords(
   const keywordMap = new Map<string, GeneratedKeyword>();
   const keywordRows: GeneratedKeyword[] = [];
 
+  const sigunguAreas = new Map<string, AdminAreaWithDistance>();
+
+  for (const area of adminAreas) {
+    if (area.sigungu && !sigunguAreas.has(area.sigungu)) {
+      sigunguAreas.set(area.sigungu, area);
+    }
+  }
+
   for (const baseKeyword of baseKeywords) {
     for (const station of stations) {
-      const stationNameWithSuffix = withStationSuffix(station.stationName);
+      const stationNameWithSuffix = withStationSuffix(normalizeStationName(station.stationName));
       const variants = keywordLocationVariants(stationNameWithSuffix, ["역"]);
 
       for (const variant of variants) {
@@ -242,8 +286,26 @@ function generateSeoKeywords(
       }
     }
 
+    // 수성구치과, 강남치과처럼 시군구 단위 키워드가 동 단위보다 검색량이 큰 경우가 많다.
+    for (const [sigungu, area] of sigunguAreas) {
+      const variants = keywordLocationVariants(sigungu, sigunguSuffixes);
+
+      for (const variant of variants) {
+        addGeneratedKeyword(keywordMap, keywordRows, mergeDuplicates, `${variant.name}${baseKeyword}`, baseKeyword, {
+          id: `sigungu:${sigungu}`,
+          originalName: sigungu,
+          keywordLocationName: variant.name,
+          itemType: "admin_area",
+          targetType: "시군구",
+          generationRule: variant.rule,
+          source: area.source,
+        });
+      }
+    }
+
     for (const area of adminAreas.filter(isTargetAdminArea)) {
-      const variants = keywordLocationVariants(area.originalName, adminSuffixes);
+      const normalizedName = normalizeAdminName(area.originalName);
+      const variants = keywordLocationVariants(normalizedName, adminSuffixes);
 
       for (const variant of variants) {
         addGeneratedKeyword(keywordMap, keywordRows, mergeDuplicates, `${variant.name}${baseKeyword}`, baseKeyword, {
@@ -407,6 +469,8 @@ function parseAdminGeoJson(geoJson: unknown) {
 
   return collection.features.filter(isPolygonFeature).map((feature, index) => {
     const properties = feature.properties ?? {};
+    const [minLng, minLat, maxLng, maxLat] = bbox(feature);
+    const [centroidLng, centroidLat] = centroid(feature).geometry.coordinates;
 
     return {
       id: textValue(properties.id, `admin-${index + 1}`),
@@ -418,8 +482,22 @@ function parseAdminGeoJson(geoJson: unknown) {
       sigungu: textValue(properties.sigungu ?? properties.sggnm),
       source: textValue(properties.source),
       feature,
+      bounds: { minLng, minLat, maxLng, maxLat },
+      centroidCoord: { lat: centroidLat, lng: centroidLng },
     };
   });
+}
+
+// 반경 원이 지도에 여유 있게 들어가는 배율을 구한다. fitBounds는 컨테이너 크기가
+// 확정되기 전에 불리면 원을 한쪽으로 밀어버려서 직접 계산한다.
+function zoomForRadius(radiusKm: number, latitude: number, viewportPx: number) {
+  const usablePx = Math.max(viewportPx * 0.82, 120);
+  const metersPerPixel = (radiusKm * 2000) / usablePx;
+  const equatorMetersPerPixel = 156543.03392 * Math.cos((latitude * Math.PI) / 180);
+  const zoom = Math.log2(equatorMetersPerPixel / metersPerPixel);
+
+  // 내림이라 원이 화면을 넘치는 일은 없다.
+  return Math.max(3, Math.min(18, Math.floor(zoom)));
 }
 
 function distanceBetweenKm(origin: Coordinate, target: Coordinate) {
@@ -454,6 +532,8 @@ export function MagicMap() {
   const circleRef = useRef<kakao.maps.Circle | null>(null);
   const geocoderRef = useRef<kakao.maps.services.Geocoder | null>(null);
   const leafletMapRef = useRef<Leaflet.Map | null>(null);
+  const shouldFitRadiusRef = useRef(false);
+  const previousRadiusKmRef = useRef(DEFAULT_RADIUS_KM);
   const leafletMarkerRef = useRef<Leaflet.Marker | null>(null);
   const leafletCircleRef = useRef<Leaflet.Circle | null>(null);
 
@@ -480,6 +560,7 @@ export function MagicMap() {
   const [stationLoadStatus, setStationLoadStatus] = useState("stations.csv를 불러오는 중입니다.");
   const [adminAreas, setAdminAreas] = useState<AdminArea[]>([]);
   const [adminLoadStatus, setAdminLoadStatus] = useState("eupmyeondong.geojson을 불러오는 중입니다.");
+  const [visibleKeywordRowCount, setVisibleKeywordRowCount] = useState(KEYWORD_ROW_RENDER_STEP);
 
   const selectedLabel = useMemo(
     () => `${formatCoordinate(center.lat)}, ${formatCoordinate(center.lng)}`,
@@ -511,18 +592,31 @@ export function MagicMap() {
       return [];
     }
 
-    return adminAreas
-      .filter((area) => booleanIntersects(radiusPolygon, area.feature))
-      .map((area) => {
-        const areaCentroid = centroid(area.feature);
-        const distanceKm = distance(centerPoint, areaCentroid, { units: "kilometers" });
+    // 전국 3,500여 개 폴리곤을 매번 전수 판정하면 반경을 바꿀 때마다 화면이 멈춘다.
+    // 값싼 bounding box 겹침 검사로 후보를 먼저 걸러내고, 남은 것만 폴리곤 교차를 본다.
+    const latDelta = radiusKm / 111.32;
+    const cosLat = Math.cos((center.lat * Math.PI) / 180);
+    const lngDelta = radiusKm / (111.32 * Math.max(Math.abs(cosLat), 0.01));
+    const searchMinLat = center.lat - latDelta;
+    const searchMaxLat = center.lat + latDelta;
+    const searchMinLng = center.lng - lngDelta;
+    const searchMaxLng = center.lng + lngDelta;
 
-        return {
-          ...area,
-          distanceKm,
-          includeRule: "polygon_intersects" as const,
-        };
+    return adminAreas
+      .filter((area) => {
+        const { minLng, minLat, maxLng, maxLat } = area.bounds;
+
+        if (maxLat < searchMinLat || minLat > searchMaxLat || maxLng < searchMinLng || minLng > searchMaxLng) {
+          return false;
+        }
+
+        return booleanIntersects(radiusPolygon, area.feature);
       })
+      .map((area) => ({
+        ...area,
+        distanceKm: distanceBetweenKm(center, area.centroidCoord),
+        includeRule: "polygon_intersects" as const,
+      }))
       .sort((left, right) => left.distanceKm - right.distanceKm);
   }, [adminAreas, center, radiusKm]);
   const generatedKeywords = useMemo(
@@ -561,6 +655,13 @@ export function MagicMap() {
       return left.keyword.localeCompare(right.keyword, "ko-KR");
     });
   }, [filteredGeneratedKeywords, keywordVolumeByKeyword]);
+  // 30km 반경이면 1,400행이 넘어 DOM이 폭발한다. 화면에는 일부만 그리고,
+  // 선택/복사/엑셀은 아래처럼 필터된 전체를 그대로 대상으로 둔다.
+  const renderedGeneratedKeywords = useMemo(
+    () => displayedGeneratedKeywords.slice(0, visibleKeywordRowCount),
+    [displayedGeneratedKeywords, visibleKeywordRowCount],
+  );
+  const hiddenKeywordRowCount = displayedGeneratedKeywords.length - renderedGeneratedKeywords.length;
   const selectedKeywordRows = useMemo(
     () => displayedGeneratedKeywords.filter((keyword) => selectedKeywordIds.includes(keyword.rowId)),
     [displayedGeneratedKeywords, selectedKeywordIds],
@@ -568,6 +669,11 @@ export function MagicMap() {
   const keywordVolumeResultCount = Object.keys(keywordVolumeByKeyword).length;
   const keywordVolumeFailedSet = useMemo(() => new Set(keywordVolumeFailedKeywords), [keywordVolumeFailedKeywords]);
   const radiusSliderIndex = Math.max(0, radiusOptions.indexOf(radiusKm));
+  const radiusStats = [
+    { label: "전철역", value: nearbyStations.length },
+    { label: "동·읍·면", value: intersectingAdminAreas.length },
+    { label: "생성 키워드", value: generatedKeywords.length },
+  ];
 
   useEffect(() => {
     let isCanceled = false;
@@ -687,8 +793,10 @@ export function MagicMap() {
         const map = leaflet.map(mapContainerRef.current, {
           center: initialPosition,
           zoom: 12,
-          zoomControl: true,
+          zoomControl: false,
         });
+        // 통계 카드가 왼쪽 위를 쓰므로 줌은 반대편으로 보낸다.
+        leaflet.control.zoom({ position: "topright" }).addTo(map);
         const markerIcon = leaflet.divIcon({
           className: "magic-map-marker",
           html: "<span></span>",
@@ -699,8 +807,8 @@ export function MagicMap() {
         const circle = leaflet
           .circle(initialPosition, {
             radius: DEFAULT_RADIUS_KM * 1000,
-            color: "#2563eb",
-            fillColor: "#38bdf8",
+            color: "#0d7a82",
+            fillColor: "#5eb3b8",
             fillOpacity: 0.18,
             opacity: 0.9,
             weight: 2,
@@ -778,10 +886,10 @@ export function MagicMap() {
       center: initialPosition,
       radius: DEFAULT_RADIUS_KM * 1000,
       strokeWeight: 2,
-      strokeColor: "#2563eb",
+      strokeColor: "#0d7a82",
       strokeOpacity: 0.9,
       strokeStyle: "solid",
-      fillColor: "#38bdf8",
+      fillColor: "#5eb3b8",
       fillOpacity: 0.18,
     });
     const geocoder = new window.kakao.maps.services.Geocoder();
@@ -828,10 +936,32 @@ export function MagicMap() {
     }
 
     const nextPosition: Leaflet.LatLngExpression = [center.lat, center.lng];
-    leafletMapRef.current.setView(nextPosition);
     leafletMarkerRef.current.setLatLng(nextPosition);
     leafletCircleRef.current.setLatLng(nextPosition);
     leafletCircleRef.current.setRadius(radiusKm * 1000);
+
+    // 주소를 찾았거나 반경을 바꿨다면 그 원을 보려는 것이므로 화면에 맞춘다.
+    // 지도를 직접 클릭해 중심만 옮길 때는 사용자가 맞춰 둔 배율을 유지한다.
+    const radiusChanged = previousRadiusKmRef.current !== radiusKm;
+    previousRadiusKmRef.current = radiusKm;
+
+    if (shouldFitRadiusRef.current || radiusChanged) {
+      shouldFitRadiusRef.current = false;
+
+      // 지도가 직접 잰 크기를 써야 배율이 맞는다. 컨테이너를 읽으면 레이아웃이
+      // 확정되기 전 값이 잡힌다.
+      leafletMapRef.current.invalidateSize({ animate: false });
+      const size = leafletMapRef.current.getSize();
+
+      // 배율까지 함께 바꿀 때 Leaflet은 줌 애니메이션을 쓰는데, 그 애니메이션은
+      // requestAnimationFrame에 기대고 있어 탭이 뒤에 있으면 끝나지 않는다.
+      leafletMapRef.current.setView(nextPosition, zoomForRadius(radiusKm, center.lat, Math.min(size.x, size.y)), {
+        animate: false,
+      });
+      return;
+    }
+
+    leafletMapRef.current.setView(nextPosition);
   }, [center, radiusKm]);
 
   async function searchOpenStreetMapAddress(trimmedAddress: string) {
@@ -868,7 +998,7 @@ export function MagicMap() {
         lng: Number(firstResult.lon),
       };
 
-      leafletMapRef.current?.setZoom(15);
+      shouldFitRadiusRef.current = true;
       setCenter(nextCenter);
       setSearchStatus(`검색 위치를 중심으로 설정했습니다: ${firstResult.display_name ?? trimmedAddress}`);
     } catch (error) {
@@ -1106,63 +1236,43 @@ export function MagicMap() {
   }
 
   return (
-    <section className="grid min-h-[680px] overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm lg:grid-cols-[360px_1fr]">
-      <aside className="flex flex-col gap-6 border-b border-slate-200 p-5 lg:border-b-0 lg:border-r">
-        <div className="space-y-2">
-          <p className="text-xs font-semibold uppercase text-blue-700">Step 5</p>
-          <h2 className="text-2xl font-semibold text-slate-950">반경 기반 SEO 키워드 생성</h2>
-          <p className="text-sm leading-6 text-slate-600">
-            주소를 검색하거나 지도 위 원하는 지점을 클릭하면 반경 안 역과 동·읍·면을 키워드와 조합합니다.
-          </p>
-        </div>
-
-        <form className="space-y-3" onSubmit={handleAddressSearch}>
-          <label className="text-sm font-medium text-slate-800" htmlFor="address-search">
-            주소 검색
+    <section className="grid min-h-[680px] overflow-hidden rounded-lg border border-rule bg-surface shadow-sm lg:grid-cols-[340px_1fr]">
+      <aside className="flex flex-col gap-7 border-b border-rule p-5 lg:border-b-0 lg:border-r">
+        <form className="space-y-2" onSubmit={handleAddressSearch}>
+          <label className="eyebrow block" htmlFor="address-search">
+            중심 지점
           </label>
           <div className="flex gap-2">
             <input
               id="address-search"
-              className="min-w-0 flex-1 rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-950 outline-none transition focus:border-blue-600 focus:ring-2 focus:ring-blue-100"
+              className="min-w-0 flex-1 rounded-md border border-rule bg-field px-3 py-2 text-sm text-ink outline-none transition placeholder:text-ink-faint focus:border-tide focus:bg-surface"
               placeholder="예: 서울특별시 중구 세종대로 110"
               value={address}
               onChange={(event) => setAddress(event.target.value)}
             />
             <button
-              className="rounded-md bg-slate-950 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+              className="rounded-md bg-ink px-4 py-2 text-sm font-semibold text-white transition hover:bg-tide-deep"
               type="submit"
             >
               검색
             </button>
           </div>
-          <p className="min-h-5 text-xs leading-5 text-slate-500">{searchStatus}</p>
+          <p className="min-h-5 text-xs leading-5 text-ink-soft">
+            {searchStatus || "지도를 직접 클릭해 지점을 잡아도 됩니다."}
+          </p>
         </form>
 
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <label className="text-sm font-medium text-slate-800" htmlFor="radius">
-              반경
-            </label>
-            <strong className="text-lg font-semibold text-blue-700">{radiusKm}km</strong>
+        <div className="space-y-3">
+          <div className="flex items-baseline justify-between">
+            <span className="eyebrow">반경</span>
+            <strong className="tabular text-lg font-semibold text-tide">{radiusKm}km</strong>
           </div>
-          <input
-            id="radius"
-            className="w-full accent-blue-700"
-            max={radiusOptions.length - 1}
-            min={0}
-            step={1}
-            type="range"
-            value={radiusSliderIndex}
-            onChange={(event) => setRadiusKm(radiusOptions[Number(event.target.value)] ?? DEFAULT_RADIUS_KM)}
-          />
-          <div className="grid grid-cols-5 gap-2">
+          <div className="scale-bar" role="group" aria-label="반경 선택">
             {radiusOptions.map((option) => (
               <button
-                className={`h-9 rounded-md border text-sm font-medium transition ${
-                  radiusKm === option
-                    ? "border-blue-700 bg-blue-700 text-white"
-                    : "border-slate-200 bg-white text-slate-700 hover:border-slate-400"
-                }`}
+                aria-pressed={radiusKm === option}
+                className="scale-tick"
+                data-major={option % 5 === 0}
                 key={option}
                 type="button"
                 onClick={() => setRadiusKm(option)}
@@ -1171,71 +1281,90 @@ export function MagicMap() {
               </button>
             ))}
           </div>
+          <input
+            aria-label="반경 슬라이더"
+            className="w-full accent-tide"
+            max={radiusOptions.length - 1}
+            min={0}
+            step={1}
+            type="range"
+            value={radiusSliderIndex}
+            onChange={(event) => setRadiusKm(radiusOptions[Number(event.target.value)] ?? DEFAULT_RADIUS_KM)}
+          />
         </div>
 
-        <div className="space-y-3">
-          <label className="text-sm font-medium text-slate-800" htmlFor="base-keywords">
+        <div className="space-y-2">
+          <label className="eyebrow block" htmlFor="base-keywords">
             기본 키워드
           </label>
           <textarea
             id="base-keywords"
-            className="min-h-28 w-full resize-y rounded-md border border-slate-300 px-3 py-2 text-sm text-slate-950 outline-none transition focus:border-blue-600 focus:ring-2 focus:ring-blue-100"
+            className="min-h-28 w-full resize-y rounded-md border border-rule bg-field px-3 py-2 text-sm text-ink outline-none transition placeholder:text-ink-faint focus:border-tide focus:bg-surface"
             placeholder={"치과, 임플란트\n소아치과"}
             value={baseKeywordInput}
             onChange={(event) => setBaseKeywordInput(event.target.value)}
           />
-          <p className="text-xs leading-5 text-slate-500">
-            쉼표 또는 줄바꿈으로 여러 키워드를 입력할 수 있습니다.
+          <p className="text-xs leading-5 text-ink-soft">
+            쉼표나 줄바꿈으로 여러 개를 넣습니다. 치과추천, 치과야간진료처럼 수식어까지 붙이면 그대로 조합합니다.
           </p>
         </div>
 
-        <dl className="mt-auto grid gap-3 rounded-lg bg-slate-50 p-4 text-sm">
-          <div>
-            <dt className="font-medium text-slate-500">선택 좌표</dt>
-            <dd className="mt-1 font-mono text-slate-950">{selectedLabel}</dd>
+        {/* 좁은 화면에서는 지도 위 카드가 지도를 다 덮으므로 여기에 같은 숫자를 둔다. */}
+        <dl className="grid grid-cols-3 gap-px overflow-hidden rounded-md border border-rule bg-rule md:hidden">
+          {radiusStats.map((stat) => (
+            <div className="bg-surface px-3 py-2" key={stat.label}>
+              <dt className="eyebrow">{stat.label}</dt>
+              <dd className="tabular mt-0.5 text-lg font-semibold text-ink">{stat.value.toLocaleString("ko-KR")}</dd>
+            </div>
+          ))}
+        </dl>
+
+        <dl className="mt-auto space-y-2 border-t border-rule-soft pt-4 text-sm">
+          <div className="flex items-baseline justify-between gap-3">
+            <dt className="text-ink-soft">선택 좌표</dt>
+            <dd className="tabular text-xs text-ink">{selectedLabel}</dd>
           </div>
-          <div>
-            <dt className="font-medium text-slate-500">검색 대상 반경</dt>
-            <dd className="mt-1 font-semibold text-slate-950">{radiusKm * 1000}m</dd>
-          </div>
-          <div>
-            <dt className="font-medium text-slate-500">반경 내 역</dt>
-            <dd className="mt-1 font-semibold text-slate-950">{nearbyStations.length.toLocaleString("ko-KR")}개</dd>
-          </div>
-          <div>
-            <dt className="font-medium text-slate-500">교차 행정구역</dt>
-            <dd className="mt-1 font-semibold text-slate-950">
-              {intersectingAdminAreas.length.toLocaleString("ko-KR")}개
-            </dd>
-          </div>
-          <div>
-            <dt className="font-medium text-slate-500">생성 키워드</dt>
-            <dd className="mt-1 font-semibold text-slate-950">{generatedKeywords.length.toLocaleString("ko-KR")}개</dd>
+          <div className="flex items-baseline justify-between gap-3">
+            <dt className="text-ink-soft">검색 대상 반경</dt>
+            <dd className="tabular text-ink">{(radiusKm * 1000).toLocaleString("ko-KR")}m</dd>
           </div>
         </dl>
       </aside>
 
-      <div className="relative min-h-[420px] bg-slate-100">
+      <div className="relative min-h-[420px] bg-canvas">
         <div className="magic-map-leaflet h-full min-h-[680px] w-full" ref={mapContainerRef} />
+        {/* 통계는 지도 옆이 아니라 지도 위에 둔다. 반경을 바꾸는 손과 숫자가 같은 곳에 있어야 한다. */}
+        <dl className="pointer-events-none absolute left-4 top-4 z-[400] hidden w-max grid-cols-3 gap-px overflow-hidden rounded-md border border-rule bg-rule shadow-sm md:grid">
+          {radiusStats.map((stat) => (
+            <div className="bg-surface/95 px-4 py-2.5 backdrop-blur-sm" key={stat.label}>
+              <dt className="eyebrow">{stat.label}</dt>
+              <dd className="tabular mt-0.5 text-xl font-semibold text-ink">
+                {stat.value.toLocaleString("ko-KR")}
+              </dd>
+            </div>
+          ))}
+        </dl>
         {(!isMapReady || activeMapLoadError) && (
-          <div className="absolute inset-0 flex items-center justify-center bg-white/80 p-6 text-center backdrop-blur-sm">
-            <div className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
-              <p className="font-semibold text-slate-950">{mapOverlayMessage}</p>
-              <p className="mt-2 text-sm text-slate-500">{mapOverlayDescription}</p>
+          <div className="absolute inset-0 flex items-center justify-center bg-surface/80 p-6 text-center backdrop-blur-sm">
+            <div className="rounded-lg border border-rule bg-surface p-5 shadow-sm">
+              <p className="font-semibold text-ink">{mapOverlayMessage}</p>
+              <p className="mt-2 text-sm text-ink-soft">{mapOverlayDescription}</p>
             </div>
           </div>
         )}
       </div>
-      <div className="border-t border-slate-200 p-5 lg:col-span-2">
-        <div className="flex flex-wrap gap-2">
+      <div className="border-t border-rule px-5 lg:col-span-2">
+        <div className="flex flex-wrap gap-6" role="tablist">
           {resultTabs.map((tab) => (
             <button
-              className={`rounded-md border px-3 py-2 text-sm font-semibold transition ${
+              aria-selected={activeTab === tab.id}
+              className={`-mb-px border-b-2 py-3 text-sm font-semibold transition ${
                 activeTab === tab.id
-                  ? "border-blue-700 bg-blue-700 text-white"
-                  : "border-slate-200 bg-white text-slate-700 hover:border-slate-400"
+                  ? "border-tide text-tide"
+                  : "border-transparent text-ink-soft hover:text-ink"
               }`}
               key={tab.id}
+              role="tab"
               type="button"
               onClick={() => setActiveTab(tab.id)}
             >
@@ -1244,52 +1373,52 @@ export function MagicMap() {
           ))}
         </div>
       </div>
-      <div className={activeTab === "summary" ? "border-t border-slate-200 p-5 lg:col-span-2" : "hidden"}>
+      <div className={activeTab === "summary" ? "border-t border-rule p-5 lg:col-span-2" : "hidden"}>
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <div className="rounded-lg border border-slate-200 p-4">
-            <p className="text-sm font-medium text-slate-500">전철역</p>
-            <strong className="mt-2 block text-3xl font-semibold text-slate-950">
+          <div className="rounded-lg border border-rule p-4">
+            <p className="text-sm font-medium text-ink-soft">전철역</p>
+            <strong className="mt-2 block text-3xl font-semibold text-ink">
               {nearbyStations.length.toLocaleString("ko-KR")}개
             </strong>
-            <p className="mt-2 text-sm text-slate-500">{stationLoadStatus}</p>
+            <p className="mt-2 text-sm text-ink-soft">{stationLoadStatus}</p>
           </div>
-          <div className="rounded-lg border border-slate-200 p-4">
-            <p className="text-sm font-medium text-slate-500">동/읍/면</p>
-            <strong className="mt-2 block text-3xl font-semibold text-slate-950">
+          <div className="rounded-lg border border-rule p-4">
+            <p className="text-sm font-medium text-ink-soft">동/읍/면</p>
+            <strong className="mt-2 block text-3xl font-semibold text-ink">
               {intersectingAdminAreas.length.toLocaleString("ko-KR")}개
             </strong>
-            <p className="mt-2 text-sm text-slate-500">{adminLoadStatus}</p>
+            <p className="mt-2 text-sm text-ink-soft">{adminLoadStatus}</p>
           </div>
-          <div className="rounded-lg border border-slate-200 p-4">
-            <p className="text-sm font-medium text-slate-500">기본 키워드</p>
-            <strong className="mt-2 block text-3xl font-semibold text-slate-950">
+          <div className="rounded-lg border border-rule p-4">
+            <p className="text-sm font-medium text-ink-soft">기본 키워드</p>
+            <strong className="mt-2 block text-3xl font-semibold text-ink">
               {baseKeywords.length.toLocaleString("ko-KR")}개
             </strong>
-            <p className="mt-2 text-sm text-slate-500">쉼표와 줄바꿈 기준</p>
+            <p className="mt-2 text-sm text-ink-soft">쉼표와 줄바꿈 기준</p>
           </div>
-          <div className="rounded-lg border border-slate-200 p-4">
-            <p className="text-sm font-medium text-slate-500">생성 키워드</p>
-            <strong className="mt-2 block text-3xl font-semibold text-slate-950">
+          <div className="rounded-lg border border-rule p-4">
+            <p className="text-sm font-medium text-ink-soft">생성 키워드</p>
+            <strong className="mt-2 block text-3xl font-semibold text-ink">
               {displayedGeneratedKeywords.length.toLocaleString("ko-KR")}개
             </strong>
-            <p className="mt-2 text-sm text-slate-500">현재 필터 적용 결과</p>
+            <p className="mt-2 text-sm text-ink-soft">현재 필터 적용 결과</p>
           </div>
         </div>
       </div>
-      <div className={activeTab === "stations" ? "border-t border-slate-200 p-5 lg:col-span-2" : "hidden"}>
+      <div className={activeTab === "stations" ? "border-t border-rule p-5 lg:col-span-2" : "hidden"}>
         <div className="mb-4 flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <h3 className="text-xl font-semibold text-slate-950">반경 내 전철역</h3>
-            <p className="text-sm text-slate-500">{stationLoadStatus}</p>
+            <h3 className="text-xl font-semibold text-ink">반경 내 전철역</h3>
+            <p className="text-sm text-ink-soft">{stationLoadStatus}</p>
           </div>
-          <p className="text-sm font-medium text-blue-700">
+          <p className="text-sm font-medium text-tide">
             {radiusKm}km 안 {nearbyStations.length.toLocaleString("ko-KR")}개 역
           </p>
         </div>
 
-        <div className="overflow-x-auto rounded-lg border border-slate-200">
+        <div className="overflow-x-auto rounded-lg border border-rule">
           <table className="min-w-[860px] w-full border-collapse text-left text-sm">
-            <thead className="bg-slate-50 text-xs font-semibold uppercase text-slate-500">
+            <thead className="bg-field text-xs font-semibold uppercase text-ink-soft">
               <tr>
                 <th className="px-4 py-3">역명</th>
                 <th className="px-4 py-3">노선</th>
@@ -1299,24 +1428,24 @@ export function MagicMap() {
                 <th className="px-4 py-3">출처</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-200 bg-white">
+            <tbody className="divide-y divide-rule-soft bg-surface">
               {nearbyStations.length > 0 ? (
                 nearbyStations.map((station, index) => (
                   <tr
-                    className="hover:bg-slate-50"
+                    className="hover:bg-field"
                     key={`${station.id}-${station.stationName}-${station.lineName}-${station.lat}-${station.lng}-${index}`}
                   >
-                    <td className="px-4 py-3 font-semibold text-slate-950">{station.stationName}</td>
-                    <td className="px-4 py-3 text-slate-700">{station.lineName}</td>
-                    <td className="px-4 py-3 font-mono text-slate-950">{formatDistance(station.distanceKm)}</td>
-                    <td className="px-4 py-3 font-mono text-slate-600">{formatCoordinate(station.lat)}</td>
-                    <td className="px-4 py-3 font-mono text-slate-600">{formatCoordinate(station.lng)}</td>
-                    <td className="px-4 py-3 text-slate-600">{station.source}</td>
+                    <td className="px-4 py-3 font-semibold text-ink">{station.stationName}</td>
+                    <td className="px-4 py-3 text-ink-soft">{station.lineName}</td>
+                    <td className="px-4 py-3 font-mono text-ink">{formatDistance(station.distanceKm)}</td>
+                    <td className="px-4 py-3 font-mono text-ink-soft">{formatCoordinate(station.lat)}</td>
+                    <td className="px-4 py-3 font-mono text-ink-soft">{formatCoordinate(station.lng)}</td>
+                    <td className="px-4 py-3 text-ink-soft">{station.source}</td>
                   </tr>
                 ))
               ) : (
                 <tr>
-                  <td className="px-4 py-10 text-center text-slate-500" colSpan={6}>
+                  <td className="px-4 py-10 text-center text-ink-soft" colSpan={6}>
                     현재 중심점과 반경 안에 표시할 역이 없습니다.
                   </td>
                 </tr>
@@ -1325,23 +1454,23 @@ export function MagicMap() {
           </table>
         </div>
       </div>
-      <div className={activeTab === "adminAreas" ? "border-t border-slate-200 p-5 lg:col-span-2" : "hidden"}>
+      <div className={activeTab === "adminAreas" ? "border-t border-rule p-5 lg:col-span-2" : "hidden"}>
         <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <h3 className="text-xl font-semibold text-slate-950">반경 교차 행정구역</h3>
-            <p className="text-sm text-slate-500">{adminLoadStatus}</p>
+            <h3 className="text-xl font-semibold text-ink">반경 교차 행정구역</h3>
+            <p className="text-sm text-ink-soft">{adminLoadStatus}</p>
             <p className="mt-1 text-sm font-medium text-amber-700">
               행정구역은 경계 교차 기준, 거리는 중심점 참고값입니다.
             </p>
           </div>
-          <p className="text-sm font-medium text-blue-700">
+          <p className="text-sm font-medium text-tide">
             {radiusKm}km 원과 교차 {intersectingAdminAreas.length.toLocaleString("ko-KR")}개
           </p>
         </div>
 
-        <div className="overflow-x-auto rounded-lg border border-slate-200">
+        <div className="overflow-x-auto rounded-lg border border-rule">
           <table className="min-w-[960px] w-full border-collapse text-left text-sm">
-            <thead className="bg-slate-50 text-xs font-semibold uppercase text-slate-500">
+            <thead className="bg-field text-xs font-semibold uppercase text-ink-soft">
               <tr>
                 <th className="px-4 py-3">원본명</th>
                 <th className="px-4 py-3">유형</th>
@@ -1352,25 +1481,25 @@ export function MagicMap() {
                 <th className="px-4 py-3">출처</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-200 bg-white">
+            <tbody className="divide-y divide-rule-soft bg-surface">
               {intersectingAdminAreas.length > 0 ? (
                 intersectingAdminAreas.map((area, index) => (
                   <tr
-                    className="hover:bg-slate-50"
+                    className="hover:bg-field"
                     key={`${area.id}-${area.originalName}-${area.sido}-${area.sigungu}-${index}`}
                   >
-                    <td className="px-4 py-3 font-semibold text-slate-950">{area.originalName}</td>
-                    <td className="px-4 py-3 text-slate-700">{area.type}</td>
-                    <td className="px-4 py-3 text-slate-700">{area.sido}</td>
-                    <td className="px-4 py-3 text-slate-700">{area.sigungu}</td>
-                    <td className="px-4 py-3 font-mono text-slate-950">{formatDistance(area.distanceKm)}</td>
-                    <td className="px-4 py-3 font-mono text-slate-700">{area.includeRule}</td>
-                    <td className="px-4 py-3 text-slate-600">{area.source}</td>
+                    <td className="px-4 py-3 font-semibold text-ink">{area.originalName}</td>
+                    <td className="px-4 py-3 text-ink-soft">{area.type}</td>
+                    <td className="px-4 py-3 text-ink-soft">{area.sido}</td>
+                    <td className="px-4 py-3 text-ink-soft">{area.sigungu}</td>
+                    <td className="px-4 py-3 font-mono text-ink">{formatDistance(area.distanceKm)}</td>
+                    <td className="px-4 py-3 font-mono text-ink-soft">{area.includeRule}</td>
+                    <td className="px-4 py-3 text-ink-soft">{area.source}</td>
                   </tr>
                 ))
               ) : (
                 <tr>
-                  <td className="px-4 py-10 text-center text-slate-500" colSpan={7}>
+                  <td className="px-4 py-10 text-center text-ink-soft" colSpan={7}>
                     현재 반경 원과 경계가 교차하는 행정구역이 없습니다.
                   </td>
                 </tr>
@@ -1379,15 +1508,15 @@ export function MagicMap() {
           </table>
         </div>
       </div>
-      <div className={activeTab === "keywords" ? "border-t border-slate-200 p-5 lg:col-span-2" : "hidden"}>
+      <div className={activeTab === "keywords" ? "border-t border-rule p-5 lg:col-span-2" : "hidden"}>
         <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <h3 className="text-xl font-semibold text-slate-950">지역 SEO 키워드</h3>
-            <p className="text-sm text-slate-500">
+            <h3 className="text-xl font-semibold text-ink">지역 SEO 키워드</h3>
+            <p className="text-sm text-ink-soft">
               suffix 포함 결과와 suffix 제거 결과를 모두 생성하고, 네이버 검색량은 현재 테이블에서 바로 조회합니다.
             </p>
           </div>
-          <p className="text-sm font-medium text-blue-700">
+          <p className="text-sm font-medium text-tide">
             기본 키워드 {baseKeywords.length.toLocaleString("ko-KR")}개 / 전체{" "}
             {generatedKeywords.length.toLocaleString("ko-KR")}개 / 표시{" "}
             {displayedGeneratedKeywords.length.toLocaleString("ko-KR")}개 / 선택{" "}
@@ -1396,11 +1525,11 @@ export function MagicMap() {
           </p>
         </div>
 
-        <div className="mb-4 grid gap-3 rounded-lg border border-slate-200 bg-slate-50 p-4 xl:grid-cols-[1fr_1fr_1fr_2fr]">
-          <label className="flex items-center gap-2 text-sm font-medium text-slate-800">
+        <div className="mb-4 grid gap-3 rounded-lg border border-rule bg-field p-4 xl:grid-cols-[1fr_1fr_1fr_2fr]">
+          <label className="flex items-center gap-2 text-sm font-medium text-ink">
             <input
               checked={mergeDuplicates}
-              className="h-4 w-4 accent-blue-700"
+              className="h-4 w-4 accent-tide"
               type="checkbox"
               onChange={(event) => {
                 setMergeDuplicates(event.target.checked);
@@ -1409,10 +1538,10 @@ export function MagicMap() {
             />
             중복 병합 {mergeDuplicates ? "ON" : "OFF"}
           </label>
-          <label className="flex flex-col gap-1 text-sm font-medium text-slate-800">
+          <label className="flex flex-col gap-1 text-sm font-medium text-ink">
             suffix 필터
             <select
-              className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+              className="rounded-md border border-rule bg-surface px-3 py-2 text-sm"
               value={suffixFilter}
               onChange={(event) => {
                 setSuffixFilter(event.target.value as SuffixFilter);
@@ -1424,10 +1553,10 @@ export function MagicMap() {
               <option value="suffix_removed">suffix 제거</option>
             </select>
           </label>
-          <label className="flex flex-col gap-1 text-sm font-medium text-slate-800">
+          <label className="flex flex-col gap-1 text-sm font-medium text-ink">
             대상 필터
             <select
-              className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm"
+              className="rounded-md border border-rule bg-surface px-3 py-2 text-sm"
               value={targetTypeFilter}
               onChange={(event) => {
                 setTargetTypeFilter(event.target.value as TargetTypeFilter);
@@ -1436,6 +1565,7 @@ export function MagicMap() {
             >
               <option value="all">전체</option>
               <option value="전철역">전철역</option>
+              <option value="시군구">시군구</option>
               <option value="동">동</option>
               <option value="읍">읍</option>
               <option value="면">면</option>
@@ -1443,7 +1573,7 @@ export function MagicMap() {
           </label>
           <div className="flex flex-wrap items-end gap-2">
             <button
-              className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-800 transition hover:border-slate-500 disabled:cursor-not-allowed disabled:opacity-50"
+              className="rounded-md border border-rule bg-surface px-3 py-2 text-sm font-semibold text-ink transition hover:border-ink-faint disabled:cursor-not-allowed disabled:opacity-50"
               disabled={displayedGeneratedKeywords.length === 0}
               type="button"
               onClick={selectAllVisibleKeywords}
@@ -1451,7 +1581,7 @@ export function MagicMap() {
               전체 선택
             </button>
             <button
-              className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-800 transition hover:border-slate-500 disabled:cursor-not-allowed disabled:opacity-50"
+              className="rounded-md border border-rule bg-surface px-3 py-2 text-sm font-semibold text-ink transition hover:border-ink-faint disabled:cursor-not-allowed disabled:opacity-50"
               disabled={selectedKeywordRows.length === 0}
               type="button"
               onClick={clearKeywordSelection}
@@ -1459,7 +1589,7 @@ export function MagicMap() {
               선택 해제
             </button>
             <button
-              className="rounded-md bg-slate-950 px-3 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+              className="rounded-md bg-ink px-3 py-2 text-sm font-semibold text-white transition hover:bg-tide-deep"
               disabled={generatedKeywords.length === 0}
               type="button"
               onClick={() => void copyKeywords(generatedKeywords, "키워드 전체를 복사했습니다.")}
@@ -1467,7 +1597,7 @@ export function MagicMap() {
               키워드 전체 복사
             </button>
             <button
-              className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-800 transition hover:border-slate-500 disabled:cursor-not-allowed disabled:opacity-50"
+              className="rounded-md border border-rule bg-surface px-3 py-2 text-sm font-semibold text-ink transition hover:border-ink-faint disabled:cursor-not-allowed disabled:opacity-50"
               disabled={selectedKeywordRows.length === 0}
               type="button"
               onClick={() => void copyKeywords(selectedKeywordRows, "선택 키워드를 복사했습니다.")}
@@ -1475,7 +1605,7 @@ export function MagicMap() {
               선택 키워드 복사
             </button>
             <button
-              className="rounded-md bg-blue-700 px-3 py-2 text-sm font-semibold text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-50"
+              className="rounded-md bg-tide px-3 py-2 text-sm font-semibold text-white transition hover:bg-tide-deep disabled:cursor-not-allowed disabled:opacity-50"
               disabled={selectedKeywordRows.length === 0 || isKeywordVolumeLoading}
               type="button"
               onClick={() =>
@@ -1485,7 +1615,7 @@ export function MagicMap() {
               {isKeywordVolumeLoading ? "조회 중..." : "선택 키워드 검색량 조회"}
             </button>
             <button
-              className="rounded-md border border-blue-300 bg-white px-3 py-2 text-sm font-semibold text-blue-700 transition hover:border-blue-500 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-50"
+              className="rounded-md border border-tide bg-surface px-3 py-2 text-sm font-semibold text-tide transition hover:border-tide-deep hover:bg-tide-wash disabled:cursor-not-allowed disabled:opacity-50"
               disabled={generatedKeywords.length === 0 || isKeywordVolumeLoading}
               type="button"
               onClick={() =>
@@ -1495,7 +1625,7 @@ export function MagicMap() {
               {isKeywordVolumeLoading ? "조회 중..." : "전체 키워드 검색량 조회"}
             </button>
             <button
-              className="rounded-md border border-emerald-300 bg-white px-3 py-2 text-sm font-semibold text-emerald-700 transition hover:border-emerald-500 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
+              className="rounded-md border border-emerald-300 bg-surface px-3 py-2 text-sm font-semibold text-emerald-700 transition hover:border-emerald-500 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50"
               disabled={displayedGeneratedKeywords.length === 0}
               type="button"
               onClick={downloadKeywordVolumeExcel}
@@ -1505,66 +1635,89 @@ export function MagicMap() {
           </div>
         </div>
 
-        {copyStatus && <p className="mb-3 text-sm font-medium text-blue-700">{copyStatus}</p>}
-        {keywordVolumeStatus && <p className="mb-3 text-sm font-medium text-blue-700">{keywordVolumeStatus}</p>}
+        {copyStatus && <p className="mb-3 text-sm font-medium text-tide">{copyStatus}</p>}
+        {keywordVolumeStatus && <p className="mb-3 text-sm font-medium text-tide">{keywordVolumeStatus}</p>}
 
-        <div className="overflow-x-auto rounded-lg border border-slate-200">
+        <div className="overflow-x-auto rounded-lg border border-rule">
           <table className="min-w-[1280px] w-full border-collapse text-left text-sm">
-            <thead className="bg-slate-50 text-xs font-semibold uppercase text-slate-500">
+            <thead className="bg-field text-xs font-semibold uppercase text-ink-soft">
               <tr>
                 <th className="px-4 py-3">
-                  <button className="font-semibold text-slate-600" type="button" onClick={toggleAllVisibleKeywords}>
+                  <button className="font-semibold text-ink-soft" type="button" onClick={toggleAllVisibleKeywords}>
                     선택
                   </button>
                 </th>
                 <th className="px-4 py-3">생성 키워드</th>
                 <th className="px-4 py-3">기본 키워드</th>
-                <th className="px-4 py-3">전체검색</th>
-                <th className="px-4 py-3">PC검색</th>
-                <th className="px-4 py-3">모바일검색</th>
-                <th className="px-4 py-3">모바일 비중</th>
+                <th className="px-4 py-3 text-right">전체검색</th>
+                <th className="px-4 py-3 text-right">PC검색</th>
+                <th className="px-4 py-3 text-right">모바일검색</th>
+                <th className="px-4 py-3 text-right">모바일 비중</th>
                 <th className="px-4 py-3">경쟁도</th>
                 <th className="px-4 py-3">추천 용도</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-200 bg-white">
-              {displayedGeneratedKeywords.length > 0 ? (
-                displayedGeneratedKeywords.map((generatedKeyword) => {
+            <tbody className="divide-y divide-rule-soft bg-surface">
+              {renderedGeneratedKeywords.length > 0 ? (
+                renderedGeneratedKeywords.map((generatedKeyword) => {
                   const keywordVolume = keywordVolumeByKeyword[generatedKeyword.keyword];
                   const keywordVolumeMissing = keywordVolumeFailedSet.has(generatedKeyword.keyword);
                   const keywordVolumeEmptyLabel = keywordVolumeMissing ? "데이터 없음" : "미조회";
 
                   return (
-                    <tr className="align-top hover:bg-slate-50" key={generatedKeyword.rowId}>
+                    <tr className="align-top hover:bg-field" key={generatedKeyword.rowId}>
                       <td className="px-4 py-3">
                         <input
                           checked={selectedKeywordIds.includes(generatedKeyword.rowId)}
-                          className="h-4 w-4 accent-blue-700"
+                          className="h-4 w-4 accent-tide"
                           type="checkbox"
                           onChange={() => toggleKeywordSelection(generatedKeyword.rowId)}
                         />
                       </td>
-                      <td className="px-4 py-3 font-semibold text-slate-950">{generatedKeyword.keyword}</td>
-                      <td className="px-4 py-3 text-slate-700">{generatedKeyword.baseKeyword}</td>
-                      <td className="px-4 py-3 text-slate-600">
+                      <td className="px-4 py-3 font-semibold text-ink">{generatedKeyword.keyword}</td>
+                      <td className="px-4 py-3 text-ink-soft">{generatedKeyword.baseKeyword}</td>
+                      {/* 전체검색은 이 표에서 유일하게 "노릴지 말지"를 가르는 숫자다. 1,000회 이상만 신호색. */}
+                      <td
+                        className={`tabular px-4 py-3 text-right ${
+                          keywordVolume && keywordVolume.totalCount >= 1000
+                            ? "font-semibold text-signal"
+                            : "text-ink"
+                        }`}
+                      >
                         {keywordVolume ? keywordVolume.totalCount.toLocaleString("ko-KR") : keywordVolumeEmptyLabel}
                       </td>
-                      <td className="px-4 py-3 text-slate-700">
+                      <td className="tabular px-4 py-3 text-right text-ink-soft">
                         {keywordVolume?.monthlyPcQcCntDisplay || keywordVolumeEmptyLabel}
                       </td>
-                      <td className="px-4 py-3 text-slate-700">
+                      <td className="tabular px-4 py-3 text-right text-ink-soft">
                         {keywordVolume?.monthlyMobileQcCntDisplay || keywordVolumeEmptyLabel}
                       </td>
-                      <td className="px-4 py-3 text-slate-700">
+                      <td className="tabular px-4 py-3 text-right text-ink-soft">
                         {keywordVolume ? `${keywordVolume.mobileRatio.toFixed(1)}%` : "-"}
                       </td>
-                      <td className="px-4 py-3 text-slate-700">{keywordVolume?.compIdx || "-"}</td>
+                      <td className="px-4 py-3">
+                        {keywordVolume?.compIdx ? (
+                          <span
+                            className={`inline-block rounded px-2 py-1 text-xs font-medium ${
+                              keywordVolume.compIdx === "낮음"
+                                ? "bg-tide-wash text-tide-deep"
+                                : keywordVolume.compIdx === "높음"
+                                  ? "bg-signal-wash text-signal"
+                                  : "bg-field text-ink-soft"
+                            }`}
+                          >
+                            {keywordVolume.compIdx}
+                          </span>
+                        ) : (
+                          <span className="text-ink-faint">-</span>
+                        )}
+                      </td>
                       <td className="px-4 py-3">
                         {keywordVolume ? (
                           <div className="flex flex-wrap gap-1">
                             {keywordVolume.recommendUse.map((recommendation) => (
                               <span
-                                className="rounded bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700"
+                                className="rounded bg-tide-wash px-2 py-1 text-xs font-medium text-tide"
                                 key={`${generatedKeyword.rowId}-${recommendation}`}
                               >
                                 {recommendation}
@@ -1572,7 +1725,7 @@ export function MagicMap() {
                             ))}
                           </div>
                         ) : (
-                          <span className="text-xs text-slate-400">-</span>
+                          <span className="text-xs text-ink-faint">-</span>
                         )}
                       </td>
                     </tr>
@@ -1580,7 +1733,7 @@ export function MagicMap() {
                 })
               ) : (
                 <tr>
-                  <td className="px-4 py-10 text-center text-slate-500" colSpan={9}>
+                  <td className="px-4 py-10 text-center text-ink-soft" colSpan={9}>
                     기본 키워드를 입력하면 반경 안 전철역과 동·읍·면 조합 키워드가 생성됩니다.
                   </td>
                 </tr>
@@ -1588,6 +1741,22 @@ export function MagicMap() {
             </tbody>
           </table>
         </div>
+        {hiddenKeywordRowCount > 0 ? (
+          <div className="flex flex-col items-center gap-2 border-t border-rule px-4 py-4">
+            <p className="text-sm text-ink-soft">
+              {renderedGeneratedKeywords.length.toLocaleString("ko-KR")}개 표시 중 · 나머지{" "}
+              {hiddenKeywordRowCount.toLocaleString("ko-KR")}개는 숨겨져 있습니다. 복사와 엑셀 저장은 숨겨진 키워드까지
+              모두 포함합니다.
+            </p>
+            <button
+              className="h-10 rounded-md border border-rule bg-surface px-4 text-sm font-medium text-ink-soft transition hover:border-ink-faint"
+              type="button"
+              onClick={() => setVisibleKeywordRowCount((current) => current + KEYWORD_ROW_RENDER_STEP)}
+            >
+              {Math.min(KEYWORD_ROW_RENDER_STEP, hiddenKeywordRowCount).toLocaleString("ko-KR")}개 더 보기
+            </button>
+          </div>
+        ) : null}
       </div>
     </section>
   );

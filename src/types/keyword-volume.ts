@@ -25,6 +25,8 @@ export type KeywordVolumeSummary = {
   failedCount: number;
   failedKeywords: string[];
   failedItems?: KeywordVolumeFailedItem[];
+  naverRequestCount?: number;
+  batchedResolvedCount?: number;
 };
 
 export type KeywordVolumeResponse = {
