@@ -84,6 +84,7 @@ type GeneratedKeyword = {
 type ResultTab = "summary" | "stations" | "adminAreas" | "keywords";
 type SuffixFilter = "all" | KeywordSourceItem["generationRule"];
 type TargetTypeFilter = "all" | KeywordSourceItem["targetType"];
+type KeywordSort = "volume" | "opportunity";
 
 type OpenStreetMapSearchResult = {
   display_name?: string;
@@ -547,6 +548,7 @@ export function MagicMap() {
   const [mergeDuplicates, setMergeDuplicates] = useState(true);
   const [suffixFilter, setSuffixFilter] = useState<SuffixFilter>("all");
   const [targetTypeFilter, setTargetTypeFilter] = useState<TargetTypeFilter>("all");
+  const [keywordSort, setKeywordSort] = useState<KeywordSort>("volume");
   const [selectedKeywordIds, setSelectedKeywordIds] = useState<string[]>([]);
   const [copyStatus, setCopyStatus] = useState("");
   const [keywordVolumeStatus, setKeywordVolumeStatus] = useState("");
@@ -633,6 +635,15 @@ export function MagicMap() {
       const rightVolume = keywordVolumeByKeyword[right.keyword];
 
       if (leftVolume && rightVolume) {
+        if (keywordSort === "opportunity") {
+          const leftScore = leftVolume.opportunityScore ?? -1;
+          const rightScore = rightVolume.opportunityScore ?? -1;
+
+          if (rightScore !== leftScore) {
+            return rightScore - leftScore;
+          }
+        }
+
         if (rightVolume.totalCount !== leftVolume.totalCount) {
           return rightVolume.totalCount - leftVolume.totalCount;
         }
@@ -654,7 +665,7 @@ export function MagicMap() {
 
       return left.keyword.localeCompare(right.keyword, "ko-KR");
     });
-  }, [filteredGeneratedKeywords, keywordVolumeByKeyword]);
+  }, [filteredGeneratedKeywords, keywordVolumeByKeyword, keywordSort]);
   // 30km 반경이면 1,400행이 넘어 DOM이 폭발한다. 화면에는 일부만 그리고,
   // 선택/복사/엑셀은 아래처럼 필터된 전체를 그대로 대상으로 둔다.
   const renderedGeneratedKeywords = useMemo(
@@ -1195,6 +1206,8 @@ export function MagicMap() {
       "PC검색",
       "모바일검색",
       "모바일비중",
+      "경쟁업체",
+      "기회지수",
       "경쟁도",
       "추천용도",
     ];
@@ -1210,6 +1223,8 @@ export function MagicMap() {
         keywordVolume?.monthlyPcQcCntDisplay || keywordVolumeEmptyLabel,
         keywordVolume?.monthlyMobileQcCntDisplay || keywordVolumeEmptyLabel,
         keywordVolume ? `${keywordVolume.mobileRatio.toFixed(1)}%` : "-",
+        keywordVolume?.placeCount === undefined ? "-" : keywordVolume.placeCount.toLocaleString("ko-KR"),
+        keywordVolume?.opportunityScore === undefined ? "-" : keywordVolume.opportunityScore.toLocaleString("ko-KR"),
         keywordVolume?.compIdx || "-",
         keywordVolume?.recommendUse.join(", ") || "-",
       ];
@@ -1571,6 +1586,17 @@ export function MagicMap() {
               <option value="면">면</option>
             </select>
           </label>
+          <label className="flex flex-col gap-1 text-sm font-medium text-ink">
+            정렬
+            <select
+              className="rounded-md border border-rule bg-surface px-3 py-2 text-sm"
+              value={keywordSort}
+              onChange={(event) => setKeywordSort(event.target.value as KeywordSort)}
+            >
+              <option value="volume">검색량순</option>
+              <option value="opportunity">기회 지수순</option>
+            </select>
+          </label>
           <div className="flex flex-wrap items-end gap-2">
             <button
               className="rounded-md border border-rule bg-surface px-3 py-2 text-sm font-semibold text-ink transition hover:border-ink-faint disabled:cursor-not-allowed disabled:opacity-50"
@@ -1653,6 +1679,8 @@ export function MagicMap() {
                 <th className="px-4 py-3 text-right">PC검색</th>
                 <th className="px-4 py-3 text-right">모바일검색</th>
                 <th className="px-4 py-3 text-right">모바일 비중</th>
+                <th className="px-4 py-3 text-right">경쟁 업체</th>
+                <th className="px-4 py-3 text-right">기회 지수</th>
                 <th className="px-4 py-3">경쟁도</th>
                 <th className="px-4 py-3">추천 용도</th>
               </tr>
@@ -1695,6 +1723,23 @@ export function MagicMap() {
                       <td className="tabular px-4 py-3 text-right text-ink-soft">
                         {keywordVolume ? `${keywordVolume.mobileRatio.toFixed(1)}%` : "-"}
                       </td>
+                      <td className="tabular px-4 py-3 text-right text-ink-soft">
+                        {keywordVolume?.placeCount === undefined
+                          ? "-"
+                          : keywordVolume.placeCount.toLocaleString("ko-KR")}
+                      </td>
+                      {/* 검색량 ÷ 경쟁 업체 수. 여기가 이 표에서 노릴 순서를 정하는 숫자다. */}
+                      <td
+                        className={`tabular px-4 py-3 text-right ${
+                          keywordVolume?.opportunityScore !== undefined && keywordVolume.opportunityScore >= 50
+                            ? "font-semibold text-signal"
+                            : "text-ink"
+                        }`}
+                      >
+                        {keywordVolume?.opportunityScore === undefined
+                          ? "-"
+                          : keywordVolume.opportunityScore.toLocaleString("ko-KR")}
+                      </td>
                       <td className="px-4 py-3">
                         {keywordVolume?.compIdx ? (
                           <span
@@ -1733,7 +1778,7 @@ export function MagicMap() {
                 })
               ) : (
                 <tr>
-                  <td className="px-4 py-10 text-center text-ink-soft" colSpan={9}>
+                  <td className="px-4 py-10 text-center text-ink-soft" colSpan={11}>
                     기본 키워드를 입력하면 반경 안 전철역과 동·읍·면 조합 키워드가 생성됩니다.
                   </td>
                 </tr>
