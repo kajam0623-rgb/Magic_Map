@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { fetchPlaceCount, hasKakaoLocalKey } from "@/lib/kakao-local/client";
 import { fetchNaverKeywordTool, NaverSearchAdConfigError, NaverSearchAdRequestError } from "@/lib/naver-searchad/client";
 import {
   findBestKeywordToolItem,
@@ -19,6 +20,8 @@ const NAVER_KEYWORD_RETRY_COUNT = 4;
 const NAVER_HINT_KEYWORDS_PER_REQUEST = 5;
 // 429를 받으면 공식 가이드에 따라 일반 지연보다 훨씬 길게 쉬어야 한다.
 const NAVER_KEYWORD_THROTTLED_DELAY_MULTIPLIER = 6;
+// 카카오 로컬은 네이버 키워드 도구처럼 조이지 않아서 몇 개씩 같이 보내도 된다.
+const KAKAO_PLACE_CONCURRENCY = 5;
 
 function sleep(ms: number) {
   return new Promise((resolve) => {
@@ -208,6 +211,32 @@ export async function POST(request: Request) {
     }
   }
 
+  // 검색량이 커도 그 동네에 병원이 이미 많으면 노릴 값어치가 없다. 카카오 로컬에서
+  // 경쟁 장소 수를 세어 검색량으로 나눈다. 키가 없으면 검색량만 그대로 돌려준다.
+  let placeCountResolved = 0;
+  let placeLookupError: string | undefined;
+  const placeLookupSkipped = !hasKakaoLocalKey();
+
+  if (!placeLookupSkipped) {
+    for (const batch of chunkArray(items, KAKAO_PLACE_CONCURRENCY)) {
+      await Promise.all(
+        batch.map(async (item) => {
+          try {
+            const placeCount = await fetchPlaceCount(item.keyword);
+
+            item.placeCount = placeCount;
+            item.opportunityScore = Math.round((item.totalCount / Math.max(placeCount, 1)) * 10) / 10;
+            placeCountResolved += 1;
+          } catch (error) {
+            // 한 키워드가 실패해도 나머지 결과는 그대로 쓴다. 다만 전부 실패하면
+            // 이유를 모르니 첫 실패는 남긴다.
+            placeLookupError ??= error instanceof Error ? error.message : String(error);
+          }
+        }),
+      );
+    }
+  }
+
   const sortedItems = items.sort(sortKeywordVolumeItems);
 
   return NextResponse.json({
@@ -220,6 +249,9 @@ export async function POST(request: Request) {
       failedItems,
       naverRequestCount,
       batchedResolvedCount,
+      placeCountResolved,
+      placeLookupSkipped,
+      placeLookupError,
     },
   } satisfies KeywordVolumeResponse);
 }

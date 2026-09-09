@@ -17,6 +17,10 @@ export type KeywordVolumeItem = {
   monthlyAveMobileCtr: number;
   compIdx: string;
   recommendUse: string[];
+  // 카카오 로컬에서 센 경쟁 장소 수. 키가 없거나 조회에 실패하면 없다.
+  placeCount?: number;
+  // 검색량 대비 경쟁 장소 수. 클수록 노려볼 만하다.
+  opportunityScore?: number;
 };
 
 export type KeywordVolumeSummary = {
@@ -27,6 +31,9 @@ export type KeywordVolumeSummary = {
   failedItems?: KeywordVolumeFailedItem[];
   naverRequestCount?: number;
   batchedResolvedCount?: number;
+  placeCountResolved?: number;
+  placeLookupSkipped?: boolean;
+  placeLookupError?: string;
 };
 
 export type KeywordVolumeResponse = {
