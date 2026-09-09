@@ -501,6 +501,22 @@ function zoomForRadius(radiusKm: number, latitude: number, viewportPx: number) {
   return Math.max(3, Math.min(18, Math.floor(zoom)));
 }
 
+// 검색량 단계별 색. 지형도 수심 단계처럼 옅은 청록에서 짙은 청록으로 간다.
+const heatColors = ["#dcebea", "#a9d2d2", "#6fb3b6", "#3a9199", "#0d7a82"];
+
+// 검색량은 몇몇 동에 크게 몰려서 최댓값 대비로 나누면 대부분 같은 색이 된다.
+// 순위로 끊어야 다섯 단계가 고르게 쓰인다.
+function heatColorFor(value: number, sortedValues: number[]) {
+  if (sortedValues.length === 0) {
+    return heatColors[0];
+  }
+
+  const rank = sortedValues.filter((candidate) => candidate < value).length / sortedValues.length;
+  const index = Math.min(heatColors.length - 1, Math.floor(rank * heatColors.length));
+
+  return heatColors[index];
+}
+
 function distanceBetweenKm(origin: Coordinate, target: Coordinate) {
   const earthRadiusKm = 6371.0088;
   const latDistance = ((target.lat - origin.lat) * Math.PI) / 180;
@@ -537,6 +553,7 @@ export function MagicMap() {
   const previousRadiusKmRef = useRef(DEFAULT_RADIUS_KM);
   const leafletMarkerRef = useRef<Leaflet.Marker | null>(null);
   const leafletCircleRef = useRef<Leaflet.Circle | null>(null);
+  const leafletHeatLayerRef = useRef<Leaflet.GeoJSON | null>(null);
 
   const [isSdkReady, setIsSdkReady] = useState(false);
   const [isLeafletReady, setIsLeafletReady] = useState(false);
@@ -673,6 +690,29 @@ export function MagicMap() {
     [displayedGeneratedKeywords, visibleKeywordRowCount],
   );
   const hiddenKeywordRowCount = displayedGeneratedKeywords.length - renderedGeneratedKeywords.length;
+  // 조회한 검색량을 그 키워드를 만들어 낸 행정구역으로 되돌려 합산한다.
+  const volumeByAdminAreaId = useMemo(() => {
+    const totals = new Map<string, number>();
+
+    for (const generatedKeyword of generatedKeywords) {
+      const volume = keywordVolumeByKeyword[generatedKeyword.keyword];
+
+      if (!volume) {
+        continue;
+      }
+
+      for (const sourceItem of generatedKeyword.sourceItems) {
+        if (sourceItem.itemType !== "admin_area") {
+          continue;
+        }
+
+        totals.set(sourceItem.id, (totals.get(sourceItem.id) ?? 0) + volume.totalCount);
+      }
+    }
+
+    return totals;
+  }, [generatedKeywords, keywordVolumeByKeyword]);
+
   const selectedKeywordRows = useMemo(
     () => displayedGeneratedKeywords.filter((keyword) => selectedKeywordIds.includes(keyword.rowId)),
     [displayedGeneratedKeywords, selectedKeywordIds],
@@ -974,6 +1014,64 @@ export function MagicMap() {
 
     leafletMapRef.current.setView(nextPosition);
   }, [center, radiusKm]);
+
+  useEffect(() => {
+    const map = leafletMapRef.current;
+
+    if (!map) {
+      return;
+    }
+
+    leafletHeatLayerRef.current?.remove();
+    leafletHeatLayerRef.current = null;
+
+    const shaded = intersectingAdminAreas.filter((area) => (volumeByAdminAreaId.get(area.id) ?? 0) > 0);
+
+    if (shaded.length === 0) {
+      return;
+    }
+
+    const sortedVolumes = shaded.map((area) => volumeByAdminAreaId.get(area.id) ?? 0).sort((a, b) => a - b);
+    let isCanceled = false;
+
+    void import("leaflet").then((leaflet) => {
+      if (isCanceled || !leafletMapRef.current) {
+        return;
+      }
+
+      const layer = leaflet.geoJSON(
+        { type: "FeatureCollection", features: shaded.map((area) => area.feature) } as never,
+        {
+          style: (feature) => {
+            const id = textValue(feature?.properties?.id);
+            const volume = volumeByAdminAreaId.get(id) ?? 0;
+
+            return {
+              color: "#ffffff",
+              weight: 1,
+              fillColor: heatColorFor(volume, sortedVolumes),
+              fillOpacity: 0.55,
+            };
+          },
+          onEachFeature: (feature, featureLayer) => {
+            const id = textValue(feature?.properties?.id);
+            const name = textValue(feature?.properties?.original_name);
+            const volume = volumeByAdminAreaId.get(id) ?? 0;
+
+            featureLayer.bindTooltip(`${name} ${volume.toLocaleString("ko-KR")}회`, { sticky: true });
+          },
+        },
+      );
+
+      // 반경 원과 마커가 색면에 가리지 않도록 맨 아래에 깐다.
+      layer.addTo(leafletMapRef.current).bringToBack();
+      leafletHeatLayerRef.current = layer;
+    });
+
+    return () => {
+      isCanceled = true;
+    };
+  }, [intersectingAdminAreas, volumeByAdminAreaId]);
 
   async function searchOpenStreetMapAddress(trimmedAddress: string) {
     setSearchStatus("OpenStreetMap에서 주소를 검색하는 중입니다.");
