@@ -54,6 +54,7 @@ export function normalizeKeywordVolumeItem(keyword: string, item: NaverKeywordTo
   const totalCount = pcSearchCount.value + mobileSearchCount.value;
   const mobileRatio = totalCount > 0 ? roundOneDecimal((mobileSearchCount.value / totalCount) * 100) : 0;
   const compIdx = item.compIdx ?? "";
+  const adDepth = parseMetricNumber(item.plAvgDepth);
 
   return {
     keyword,
@@ -69,6 +70,10 @@ export function normalizeKeywordVolumeItem(keyword: string, item: NaverKeywordTo
     monthlyAvePcCtr: parseMetricNumber(item.monthlyAvePcCtr),
     monthlyAveMobileCtr: parseMetricNumber(item.monthlyAveMobileCtr),
     compIdx,
+    adDepth,
+    // 카카오 키가 없어도 경쟁 대비 값어치는 보여야 하므로 광고 노출 수로 먼저 잡아 둔다.
+    opportunityScore: Math.round((totalCount / Math.max(adDepth, 1)) * 10) / 10,
+    opportunityBasis: "ad",
     recommendUse: buildKeywordVolumeRecommendations(totalCount, mobileRatio, compIdx),
   };
 }

@@ -225,7 +225,9 @@ export async function POST(request: Request) {
             const placeCount = await fetchPlaceCount(item.keyword);
 
             item.placeCount = placeCount;
+            // 실제 업체 수가 광고 노출 수보다 정확하므로 있으면 그쪽으로 바꾼다.
             item.opportunityScore = Math.round((item.totalCount / Math.max(placeCount, 1)) * 10) / 10;
+            item.opportunityBasis = "place";
             placeCountResolved += 1;
           } catch (error) {
             // 한 키워드가 실패해도 나머지 결과는 그대로 쓴다. 다만 전부 실패하면
