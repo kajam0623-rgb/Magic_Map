@@ -81,7 +81,7 @@ type GeneratedKeyword = {
   sourceItems: KeywordSourceItem[];
 };
 
-type ResultTab = "summary" | "stations" | "adminAreas" | "keywords";
+type ResultTab = "summary" | "stations" | "adminAreas" | "keywords" | "pagePlan";
 type SuffixFilter = "all" | KeywordSourceItem["generationRule"];
 type TargetTypeFilter = "all" | KeywordSourceItem["targetType"];
 type KeywordSort = "volume" | "opportunity";
@@ -112,6 +112,7 @@ const resultTabs: { id: ResultTab; label: string }[] = [
   { id: "stations", label: "전철역" },
   { id: "adminAreas", label: "동/읍/면" },
   { id: "keywords", label: "생성 키워드" },
+  { id: "pagePlan", label: "만들 페이지" },
 ];
 
 function formatCoordinate(value: number) {
@@ -713,6 +714,76 @@ export function MagicMap() {
     return totals;
   }, [generatedKeywords, keywordVolumeByKeyword]);
 
+  // 키워드 하나에 페이지 하나를 만들 수는 없다. 같은 지명을 노리는 키워드는
+  // 한 페이지가 같이 먹으므로 지명 단위로 묶어서 "만들 페이지"로 내놓는다.
+  const pagePlans = useMemo(() => {
+    const groups = new Map<
+      string,
+      { locationName: string; targetType: string; keywords: { keyword: string; totalCount: number; opportunityScore?: number }[] }
+    >();
+
+    for (const generatedKeyword of filteredGeneratedKeywords) {
+      const volume = keywordVolumeByKeyword[generatedKeyword.keyword];
+      const sourceItem = generatedKeyword.sourceItems[0];
+
+      if (!sourceItem) {
+        continue;
+      }
+
+      const key = sourceItem.keywordLocationName;
+      const group = groups.get(key) ?? {
+        locationName: key,
+        targetType: sourceItem.targetType,
+        keywords: [],
+      };
+
+      group.keywords.push({
+        keyword: generatedKeyword.keyword,
+        totalCount: volume?.totalCount ?? 0,
+        opportunityScore: volume?.opportunityScore,
+      });
+      groups.set(key, group);
+    }
+
+    return Array.from(groups.values())
+      .map((group) => {
+        const keywords = [...group.keywords].sort((left, right) => right.totalCount - left.totalCount);
+        const scores = keywords.map((item) => item.opportunityScore).filter((score): score is number => score !== undefined);
+
+        return {
+          ...group,
+          keywords,
+          totalVolume: keywords.reduce((sum, item) => sum + item.totalCount, 0),
+          bestScore: scores.length > 0 ? Math.max(...scores) : undefined,
+        };
+      })
+      .sort((left, right) => right.totalVolume - left.totalVolume);
+  }, [filteredGeneratedKeywords, keywordVolumeByKeyword]);
+
+  // 페이지를 예순 개씩 만드는 병원은 없다. 검색량의 80%를 먹는 지점까지가
+  // 먼저 손대야 할 몫이고, 나머지는 여력이 있을 때다.
+  const pagePlanPriority = useMemo(() => {
+    const totalVolume = pagePlans.reduce((sum, plan) => sum + plan.totalVolume, 0);
+
+    if (totalVolume === 0) {
+      return { firstBatchCount: 0, totalVolume: 0, coveredVolume: 0 };
+    }
+
+    let covered = 0;
+    let count = 0;
+
+    for (const plan of pagePlans) {
+      covered += plan.totalVolume;
+      count += 1;
+
+      if (covered / totalVolume >= 0.8) {
+        break;
+      }
+    }
+
+    return { firstBatchCount: count, totalVolume, coveredVolume: covered };
+  }, [pagePlans]);
+
   const selectedKeywordRows = useMemo(
     () => displayedGeneratedKeywords.filter((keyword) => selectedKeywordIds.includes(keyword.rowId)),
     [displayedGeneratedKeywords, selectedKeywordIds],
@@ -1152,11 +1223,9 @@ export function MagicMap() {
     });
   }
 
-  async function copyKeywords(rows: GeneratedKeyword[], successMessage: string) {
-    const text = rows.map((row) => row.keyword).join("\n");
-
+  async function copyTextToClipboard(text: string, successMessage: string) {
     if (!text) {
-      setCopyStatus("복사할 키워드가 없습니다.");
+      setCopyStatus("복사할 내용이 없습니다.");
       return;
     }
 
@@ -1166,6 +1235,10 @@ export function MagicMap() {
     } catch {
       setCopyStatus("브라우저 클립보드 권한 때문에 복사하지 못했습니다.");
     }
+  }
+
+  async function copyKeywords(rows: GeneratedKeyword[], successMessage: string) {
+    await copyTextToClipboard(rows.map((row) => row.keyword).join("\n"), successMessage);
   }
 
   function toggleKeywordSelection(rowId: string) {
@@ -1294,6 +1367,23 @@ export function MagicMap() {
     } finally {
       setIsKeywordVolumeLoading(false);
     }
+  }
+
+  async function copyPagePlan() {
+    const lines = pagePlans.map((plan, index) => {
+      const head = `## ${index + 1}. ${plan.locationName} 페이지 (${plan.targetType})`;
+      const volume = `- 합산 검색량: 월 ${plan.totalVolume.toLocaleString("ko-KR")}회`;
+      const score = plan.bestScore === undefined ? null : `- 최고 기회 지수: ${plan.bestScore.toLocaleString("ko-KR")}`;
+      const main = `- 대표 키워드: ${plan.keywords[0]?.keyword ?? "-"}`;
+      const rest = `- 함께 노릴 키워드: ${plan.keywords.map((item) => item.keyword).join(", ")}`;
+
+      return [head, volume, score, main, rest].filter(Boolean).join("\n");
+    });
+
+    await copyTextToClipboard(
+      [`# 만들 페이지 ${pagePlans.length}개`, "", ...lines].join("\n\n"),
+      `${pagePlans.length.toLocaleString("ko-KR")}개 페이지 계획을 복사했습니다.`,
+    );
   }
 
   function downloadKeywordVolumeExcel() {
@@ -1622,6 +1712,73 @@ export function MagicMap() {
             </tbody>
           </table>
         </div>
+      </div>
+      <div className={activeTab === "pagePlan" ? "border-t border-rule p-5 lg:col-span-2" : "hidden"}>
+        <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <h3 className="text-xl font-semibold text-ink">만들 페이지</h3>
+            <p className="mt-1 text-sm text-ink-soft">
+              같은 지명을 노리는 키워드는 페이지 하나가 함께 먹습니다. 지명으로 묶어 검색량이 큰 순서대로 세웠습니다.
+            </p>
+            {pagePlanPriority.firstBatchCount > 0 ? (
+              <p className="mt-2 text-sm font-medium text-ink">
+                위 <strong className="tabular text-signal">{pagePlanPriority.firstBatchCount}개</strong>만 만들면 이 반경
+                검색량의 80%(월 {pagePlanPriority.coveredVolume.toLocaleString("ko-KR")}회)를 덮습니다. 나머지{" "}
+                {(pagePlans.length - pagePlanPriority.firstBatchCount).toLocaleString("ko-KR")}개는 여력이 생기면
+                하세요.
+              </p>
+            ) : null}
+          </div>
+          <button
+            className="rounded-md bg-ink px-4 py-2 text-sm font-semibold text-white transition hover:bg-tide-deep disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={pagePlans.length === 0}
+            type="button"
+            onClick={copyPagePlan}
+          >
+            작업 목록 복사
+          </button>
+        </div>
+        {pagePlans.length === 0 ? (
+          <p className="rounded-md border border-rule bg-field px-4 py-10 text-center text-sm text-ink-soft">
+            기본 키워드를 입력하면 만들 페이지가 정리됩니다.
+          </p>
+        ) : (
+          <ol className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {pagePlans.map((plan, index) => (
+              <li
+                className={`rounded-md border bg-surface p-4 ${
+                  index < pagePlanPriority.firstBatchCount ? "border-tide" : "border-rule opacity-70"
+                }`}
+                key={plan.locationName}
+              >
+                <div className="flex items-baseline justify-between gap-2">
+                  <h4 className="font-semibold text-ink">
+                    <span className="tabular mr-2 text-ink-faint">{String(index + 1).padStart(2, "0")}</span>
+                    {plan.locationName}
+                  </h4>
+                  <span className="eyebrow">{plan.targetType}</span>
+                </div>
+                <dl className="mt-3 flex gap-5 text-sm">
+                  <div>
+                    <dt className="eyebrow">합산 검색량</dt>
+                    <dd className="tabular mt-0.5 text-lg font-semibold text-ink">
+                      {plan.totalVolume > 0 ? plan.totalVolume.toLocaleString("ko-KR") : "미조회"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="eyebrow">최고 기회</dt>
+                    <dd className="tabular mt-0.5 text-lg font-semibold text-signal">
+                      {plan.bestScore === undefined ? "-" : plan.bestScore.toLocaleString("ko-KR")}
+                    </dd>
+                  </div>
+                </dl>
+                <p className="mt-3 text-xs leading-5 text-ink-soft">
+                  {plan.keywords.map((item) => item.keyword).join(", ")}
+                </p>
+              </li>
+            ))}
+          </ol>
+        )}
       </div>
       <div className={activeTab === "keywords" ? "border-t border-rule p-5 lg:col-span-2" : "hidden"}>
         <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
