@@ -195,6 +195,14 @@ function keywordLocationVariants(nameWithSuffix: string, suffixes: string[]) {
   });
 }
 
+// 경기도에는 고양시덕양구처럼 시와 구가 한 이름에 붙은 시군구가 서른아홉 개 있다.
+// 그대로 두면 "고양시덕양"처럼 아무도 검색하지 않는 말이 나오므로 구와 시로 나눈다.
+function sigunguNames(sigungu: string) {
+  const compound = sigungu.match(/^(.+?시)(.+구)$/);
+
+  return compound ? [compound[2], compound[1]] : [sigungu];
+}
+
 function isTargetAdminArea(area: AdminAreaWithDistance) {
   return adminSuffixes.includes(area.type) || adminSuffixes.some((suffix) => area.originalName.endsWith(suffix));
 }
@@ -291,7 +299,7 @@ function generateSeoKeywords(
 
     // 수성구치과, 강남치과처럼 시군구 단위 키워드가 동 단위보다 검색량이 큰 경우가 많다.
     for (const [sigungu, area] of sigunguAreas) {
-      const variants = keywordLocationVariants(sigungu, sigunguSuffixes);
+      const variants = sigunguNames(sigungu).flatMap((name) => keywordLocationVariants(name, sigunguSuffixes));
 
       for (const variant of variants) {
         addGeneratedKeyword(keywordMap, keywordRows, mergeDuplicates, `${variant.name}${baseKeyword}`, baseKeyword, {
@@ -552,6 +560,7 @@ export function MagicMap() {
   const geocoderRef = useRef<kakao.maps.services.Geocoder | null>(null);
   const leafletMapRef = useRef<Leaflet.Map | null>(null);
   const shouldFitRadiusRef = useRef(false);
+  const resultsRef = useRef<HTMLDivElement | null>(null);
   const previousRadiusKmRef = useRef(DEFAULT_RADIUS_KM);
   const leafletMarkerRef = useRef<Leaflet.Marker | null>(null);
   const leafletCircleRef = useRef<Leaflet.Circle | null>(null);
@@ -1214,6 +1223,12 @@ export function MagicMap() {
     });
   }
 
+  async function runLookupAndShowPlan() {
+    setActiveTab("pagePlan");
+    resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    await fetchKeywordVolumes(displayedGeneratedKeywords, "조회할 키워드가 없습니다.");
+  }
+
   async function copyTextToClipboard(text: string, successMessage: string) {
     if (!text) {
       setCopyStatus("복사할 내용이 없습니다.");
@@ -1503,6 +1518,19 @@ export function MagicMap() {
           <p className="text-xs leading-5 text-ink-soft">
             쉼표나 줄바꿈으로 여러 개를 넣습니다. 치과추천, 치과야간진료처럼 수식어까지 붙이면 그대로 조합합니다.
           </p>
+          {/* 키워드를 넣어도 이 자리에서는 아무 일도 없어 보인다. 결과까지 한 번에 데려간다. */}
+          <button
+            className="w-full rounded-md bg-tide px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-tide-deep disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={generatedKeywords.length === 0 || isKeywordVolumeLoading}
+            type="button"
+            onClick={runLookupAndShowPlan}
+          >
+            {isKeywordVolumeLoading
+              ? "검색량 조회 중..."
+              : generatedKeywords.length === 0
+                ? "키워드를 입력하세요"
+                : `키워드 ${generatedKeywords.length.toLocaleString("ko-KR")}개 검색량 조회`}
+          </button>
         </div>
 
         {/* 좁은 화면에서는 지도 위 카드가 지도를 다 덮으므로 여기에 같은 숫자를 둔다. */}
@@ -1549,7 +1577,7 @@ export function MagicMap() {
           </div>
         )}
       </div>
-      <div className="border-t border-rule px-5 lg:col-span-2">
+      <div className="border-t border-rule px-5 lg:col-span-2" ref={resultsRef}>
         <div className="flex flex-wrap gap-6" role="tablist">
           {resultTabs.map((tab) => (
             <button
