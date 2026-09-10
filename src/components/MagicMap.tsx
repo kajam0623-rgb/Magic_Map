@@ -107,6 +107,7 @@ const radiusOptions = [...Array.from({ length: 10 }, (_, index) => index + 1), 2
 const adminSuffixes = ["동", "읍", "면"];
 const sigunguSuffixes = ["구", "시", "군"];
 const MIN_LOCATION_NAME_LENGTH = 2;
+const FIRST_BATCH_PAGE_COUNT = 5;
 const resultTabs: { id: ResultTab; label: string }[] = [
   { id: "summary", label: "전체 요약" },
   { id: "stations", label: "전철역" },
@@ -567,6 +568,7 @@ export function MagicMap() {
   const [suffixFilter, setSuffixFilter] = useState<SuffixFilter>("all");
   const [targetTypeFilter, setTargetTypeFilter] = useState<TargetTypeFilter>("all");
   const [keywordSort, setKeywordSort] = useState<KeywordSort>("volume");
+  const [showAllPagePlans, setShowAllPagePlans] = useState(false);
   const [selectedKeywordIds, setSelectedKeywordIds] = useState<string[]>([]);
   const [copyStatus, setCopyStatus] = useState("");
   const [keywordVolumeStatus, setKeywordVolumeStatus] = useState("");
@@ -760,28 +762,17 @@ export function MagicMap() {
       .sort((left, right) => right.totalVolume - left.totalVolume);
   }, [filteredGeneratedKeywords, keywordVolumeByKeyword]);
 
-  // 페이지를 예순 개씩 만드는 병원은 없다. 검색량의 80%를 먹는 지점까지가
-  // 먼저 손대야 할 몫이고, 나머지는 여력이 있을 때다.
+  // 한 번에 손댈 수 있는 분량은 정해져 있다. 상위 다섯 개를 먼저 만들고
+  // 그것이 검색량의 몇 퍼센트를 덮는지 같이 보여준다.
   const pagePlanPriority = useMemo(() => {
     const totalVolume = pagePlans.reduce((sum, plan) => sum + plan.totalVolume, 0);
+    const firstBatchCount = Math.min(FIRST_BATCH_PAGE_COUNT, pagePlans.length);
+    const coveredVolume = pagePlans
+      .slice(0, firstBatchCount)
+      .reduce((sum, plan) => sum + plan.totalVolume, 0);
+    const coverageRatio = totalVolume > 0 ? Math.round((coveredVolume / totalVolume) * 100) : 0;
 
-    if (totalVolume === 0) {
-      return { firstBatchCount: 0, totalVolume: 0, coveredVolume: 0 };
-    }
-
-    let covered = 0;
-    let count = 0;
-
-    for (const plan of pagePlans) {
-      covered += plan.totalVolume;
-      count += 1;
-
-      if (covered / totalVolume >= 0.8) {
-        break;
-      }
-    }
-
-    return { firstBatchCount: count, totalVolume, coveredVolume: covered };
+    return { firstBatchCount, totalVolume, coveredVolume, coverageRatio };
   }, [pagePlans]);
 
   const selectedKeywordRows = useMemo(
@@ -1722,10 +1713,9 @@ export function MagicMap() {
             </p>
             {pagePlanPriority.firstBatchCount > 0 ? (
               <p className="mt-2 text-sm font-medium text-ink">
-                위 <strong className="tabular text-signal">{pagePlanPriority.firstBatchCount}개</strong>만 만들면 이 반경
-                검색량의 80%(월 {pagePlanPriority.coveredVolume.toLocaleString("ko-KR")}회)를 덮습니다. 나머지{" "}
-                {(pagePlans.length - pagePlanPriority.firstBatchCount).toLocaleString("ko-KR")}개는 여력이 생기면
-                하세요.
+                이 <strong className="tabular text-signal">{pagePlanPriority.firstBatchCount}개</strong>부터 만드세요. 이
+                반경 검색량의 <strong className="tabular">{pagePlanPriority.coverageRatio}%</strong>(월{" "}
+                {pagePlanPriority.coveredVolume.toLocaleString("ko-KR")}회)를 덮습니다.
               </p>
             ) : null}
           </div>
@@ -1744,7 +1734,7 @@ export function MagicMap() {
           </p>
         ) : (
           <ol className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-            {pagePlans.map((plan, index) => (
+            {(showAllPagePlans ? pagePlans : pagePlans.slice(0, pagePlanPriority.firstBatchCount)).map((plan, index) => (
               <li
                 className={`rounded-md border bg-surface p-4 ${
                   index < pagePlanPriority.firstBatchCount ? "border-tide" : "border-rule opacity-70"
@@ -1779,6 +1769,17 @@ export function MagicMap() {
             ))}
           </ol>
         )}
+        {pagePlans.length > pagePlanPriority.firstBatchCount ? (
+          <button
+            className="mt-3 rounded-md border border-rule bg-surface px-4 py-2 text-sm font-medium text-ink-soft transition hover:border-ink-faint"
+            type="button"
+            onClick={() => setShowAllPagePlans((current) => !current)}
+          >
+            {showAllPagePlans
+              ? "우선순위 5개만 보기"
+              : `나머지 ${(pagePlans.length - pagePlanPriority.firstBatchCount).toLocaleString("ko-KR")}개도 보기`}
+          </button>
+        ) : null}
       </div>
       <div className={activeTab === "keywords" ? "border-t border-rule p-5 lg:col-span-2" : "hidden"}>
         <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
