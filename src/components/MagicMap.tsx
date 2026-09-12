@@ -1518,18 +1518,19 @@ export function MagicMap() {
           <p className="text-xs leading-5 text-ink-soft">
             쉼표나 줄바꿈으로 여러 개를 넣습니다. 치과추천, 치과야간진료처럼 수식어까지 붙이면 그대로 조합합니다.
           </p>
-          {/* 키워드를 넣어도 이 자리에서는 아무 일도 없어 보인다. 결과까지 한 번에 데려간다. */}
+          {/* 키워드를 넣어도 이 자리에서는 아무 일도 없어 보인다. 결과까지 한 번에 데려간다.
+              개수와 활성 여부는 실제 조회 대상인 필터 적용 후 목록을 따라야 어긋나지 않는다. */}
           <button
             className="w-full rounded-md bg-tide px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-tide-deep disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={generatedKeywords.length === 0 || isKeywordVolumeLoading}
+            disabled={displayedGeneratedKeywords.length === 0 || isKeywordVolumeLoading}
             type="button"
             onClick={runLookupAndShowPlan}
           >
             {isKeywordVolumeLoading
               ? "검색량 조회 중..."
-              : generatedKeywords.length === 0
-                ? "키워드를 입력하세요"
-                : `키워드 ${generatedKeywords.length.toLocaleString("ko-KR")}개 검색량 조회`}
+              : displayedGeneratedKeywords.length === 0
+                ? "조회할 키워드가 없습니다"
+                : `키워드 ${displayedGeneratedKeywords.length.toLocaleString("ko-KR")}개 검색량 조회`}
           </button>
         </div>
 
